@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install packages
-        run: pip install requests pandas lxml holidays
+        run: pip install requests pandas holidays
 
       - name: Run alert
         run: python stock_alert.py
