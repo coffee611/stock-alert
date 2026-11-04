@@ -40,6 +40,9 @@ HEADERS = {
 DATE_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}$")
 
 
+LAST_INFO = {"msg": ""}  # 마지막 실패 원인 기록 (진단용)
+
+
 def http_get(url, retry=3):
     for i in range(retry):
         try:
@@ -48,8 +51,11 @@ def http_get(url, retry=3):
             if r.status_code == 200:
                 r.encoding = "euc-kr"  # 네이버 금융은 euc-kr
                 return r.text
-        except Exception:
-            pass
+            snippet = r.text[:150].replace("\n", " ")
+            LAST_INFO["msg"] = f"HTTP {r.status_code} / {url} / {snippet}"
+        except Exception as e:
+            LAST_INFO["msg"] = f"접속 오류 {type(e).__name__}: {str(e)[:150]} / {url}"
+        print("요청 실패:", LAST_INFO["msg"])
         time.sleep(1 + i)
     return None
 
@@ -64,7 +70,13 @@ def get_universe():
                             f"?sosok={sosok}&page={page}")
             if not html:
                 continue
-            for code, name in pat.findall(html):
+            found = pat.findall(html)
+            if not found:
+                LAST_INFO["msg"] = ("접속은 됐으나 종목을 못 읽음 (화면 구조 변경/차단 페이지 가능성) "
+                                    f"/ 응답 길이 {len(html)} / 앞부분: "
+                                    + html[:150].replace("\n", " "))
+                print(LAST_INFO["msg"])
+            for code, name in found:
                 if code not in seen:
                     seen.add(code)
                     stocks.append((code, name.strip()))
@@ -267,7 +279,8 @@ def main():
         return
     stocks = get_universe()
     if not stocks:
-        send_telegram("⚠ 네이버 금융에서 종목 목록을 가져오지 못했습니다. (접속 차단/화면 변경 가능성)")
+        send_telegram("⚠ 네이버 금융에서 종목 목록을 가져오지 못했습니다. (접속 차단/화면 변경 가능성)\n"
+                      "진단: " + (LAST_INFO["msg"] or "원인 기록 없음"))
         return
     print("검사 종목 수:", len(stocks))
 
