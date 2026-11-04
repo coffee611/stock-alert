@@ -33,6 +33,11 @@ MA_PERIOD = 60          # 이동평균선 기간
 MA_FLAT_PCT = 2.0       # 60일선 20일 변화율이 ±2% 이내면 '횡보'
 MA_STRICT_DAYS = 14     # 엄격 기준: 20일 중 60일선이 전일보다 오른(내린) 날이 14일(70%) 이상
 
+# ⭐ 눌림목 패턴 (박스 하단 + 급증일 상승일 + 60일선 엄격 상승 + 종가가 60일선 근처)
+PULLBACK_BOX_MAX = 33       # 박스 위치 33% 이하(하단)
+PULLBACK_SPIKE_UP_MIN = 2   # 급증일 중 종가가 전일보다 오른 날 2일 이상
+PULLBACK_MA_GAP = 3.0       # 종가가 60일선 대비 ±3% 이내
+
 USE_INSTITUTION = True  # True: 기관 20일 누적 순매수량이 플러스인 종목만
 PER_MARKET_COUNT = 400  # 코스피/코스닥 각각 시가총액 상위 몇 종목을 검사할지
 MAX_PER_CONDITION = 30  # 조건별 메시지에 표시할 최대 종목 수
@@ -328,6 +333,7 @@ def analyze(code, name):
         "inst_amt": 0 if pd.isna(inst_amt) else inst_amt,
         "ma_label": None, "ma_chg": None, "ma_up_days": None,
         "ma_dn_days": None, "ma_strict": "", "above_ma": None,
+        "ma_gap": None, "pullback": False,
     }, "ok", last_date
 
 
@@ -342,6 +348,7 @@ def enrich_ma(r):
     close = df["close"].reset_index(drop=True)
     ma = close.rolling(MA_PERIOD).mean()
     r["above_ma"] = bool(close.iloc[-1] >= ma.iloc[-1])
+    r["ma_gap"] = float((close.iloc[-1] / ma.iloc[-1] - 1) * 100)  # 종가의 60일선 대비 거리(%)
     if len(df) < need:
         r["ma_label"] = "부족"
         return
@@ -361,11 +368,23 @@ def enrich_ma(r):
         r["ma_strict"] = "down"
 
 
+def is_pullback(r):
+    """⭐ 눌림목 패턴: 60일선이 꾸준히 오르는 추세에서 종가가 60일선 근처(±3%)까지 내려와 있고,
+    박스 하단이며, 거래량 급증일에는 주가가 오른 날이 많았던 종목"""
+    gap = r.get("ma_gap")
+    return bool(gap is not None
+                and abs(gap) <= PULLBACK_MA_GAP
+                and r["box_pos"] <= PULLBACK_BOX_MAX
+                and r["spike_up"] >= PULLBACK_SPIKE_UP_MIN
+                and r["ma_label"] == "상승"
+                and r["ma_strict"] == "up")
+
+
 # ---------------------------------------------------------------- 성과 기록
 HIST_COLS = ["base_date", "code", "name", "conds", "n_conds", "close", "box_pos",
-             "ma_label", "ma_chg", "ma_strict", "above_ma", "spike_dir",
-             "inst_amt", "r5", "r10", "r20"]
-NUM_COLS = ["n_conds", "close", "box_pos", "ma_chg", "inst_amt", "r5", "r10", "r20"]
+             "ma_label", "ma_chg", "ma_strict", "above_ma", "ma_gap", "spike_dir",
+             "pullback2", "inst_amt", "r5", "r10", "r20"]
+NUM_COLS = ["n_conds", "close", "box_pos", "ma_chg", "ma_gap", "inst_amt", "r5", "r10", "r20"]
 
 
 def load_history():
@@ -384,7 +403,7 @@ def load_history():
     for c in NUM_COLS:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     for c in ("base_date", "code", "name", "conds", "ma_label", "ma_strict",
-              "above_ma", "spike_dir"):
+              "above_ma", "spike_dir", "pullback2"):
         df[c] = df[c].fillna("").astype(str)
     return df
 
@@ -411,7 +430,9 @@ def record_history(df, results):
                                                         if r["ma_chg"] is not None else None),
             "ma_strict": r["ma_strict"], "above_ma": "" if r["above_ma"] is None
             else ("Y" if r["above_ma"] else "N"),
-            "spike_dir": r["spike_dir"], "inst_amt": round(r["inst_amt"], 1),
+            "ma_gap": (round(r["ma_gap"], 2) if r.get("ma_gap") is not None else None),
+            "spike_dir": r["spike_dir"], "pullback2": "Y" if r.get("pullback") else "N",
+            "inst_amt": round(r["inst_amt"], 1),
             "r5": None, "r10": None, "r20": None,
         })
     if rows:
@@ -474,6 +495,7 @@ def build_performance_message(df):
     def has_cond(k):
         return df["conds"].apply(lambda s: str(k) in str(s).split(","))
 
+    g = df["ma_gap"]  # 종가의 60일선 대비 거리(%)
     groups = [
         ("전체 알림 종목", df),
         ("조건1", df[has_cond(1)]), ("조건2", df[has_cond(2)]), ("조건3", df[has_cond(3)]),
@@ -487,6 +509,14 @@ def build_performance_message(df):
         ("급증일 매도세 우위", df[df["spike_dir"] == "매도세 우위"]),
         ("박스 상단(67%↑)", df[df["box_pos"] >= 67]),
         ("박스 하단(33%↓)", df[df["box_pos"] <= 33]),
+        ("⭐ 눌림목 패턴 (60일선 ±3%)", df[df["pullback2"] == "Y"]),
+        ("눌림목 아닌 종목 (비교용)", df[df["pullback2"] == "N"]),
+        ("종가 60일선 대비 -10% 이하", df[g <= -10]),
+        ("종가 60일선 대비 -10~-3%", df[(g > -10) & (g <= -3)]),
+        ("종가 60일선 대비 -3~0%", df[(g > -3) & (g <= 0)]),
+        ("종가 60일선 대비 0~+3%", df[(g > 0) & (g <= 3)]),
+        ("종가 60일선 대비 +3~+10%", df[(g > 3) & (g <= 10)]),
+        ("종가 60일선 대비 +10% 초과", df[g > 10]),
     ]
     lines = ["📈 <b>성과 기록</b> | 과거 알림 종목의 이후 수익률",
              f"누적 기록 {len(df)}건 / 5일 경과 {len(ev)}건",
@@ -584,7 +614,9 @@ def spike_line(r):
 def ma_line(r):
     lab = r.get("ma_label")
     pos = ""
-    if r.get("above_ma") is not None:
+    if r.get("ma_gap") is not None:
+        pos = f" · 종가 60일선 대비 <b>{r['ma_gap']:+.1f}%</b>"
+    elif r.get("above_ma") is not None:
         pos = " · 종가 60일선 " + ("위" if r["above_ma"] else "아래")
     if lab in (None, "부족"):
         return f"📈 60일선 방향 판정 불가(데이터 부족){pos}\n"
@@ -606,9 +638,11 @@ def send_condition_messages(results, total, nodata, base_date):
         shown = items[:MAX_PER_CONDITION]
         n3 = sum(1 for r in items if len(r["hits"]) >= 3)
         n2 = sum(1 for r in items if len(r["hits"]) == 2)
+        npb = sum(1 for r in items if r.get("pullback"))
         tier_txt = ""
-        if n3 or n2:
-            parts = ([f"🔴 3개충족 {n3}"] if n3 else []) + ([f"🟠 2개충족 {n2}"] if n2 else [])
+        if n3 or n2 or npb:
+            parts = ([f"🔴 3개충족 {n3}"] if n3 else []) + ([f"🟠 2개충족 {n2}"] if n2 else []) \
+                + ([f"⭐ 눌림목 {npb}"] if npb else [])
             tier_txt = " (" + " · ".join(parts) + ")"
 
         header = (f"{icon} <b>{title}</b> | {esc(desc)}\n"
@@ -620,12 +654,15 @@ def send_condition_messages(results, total, nodata, base_date):
         blocks = []
         for n, r in enumerate(shown, 1):
             icon_t, label_t = tier(r)
-            mark = f"{icon_t} " if icon_t else ""
+            mark = (f"{icon_t} " if icon_t else "") + ("⭐ " if r.get("pullback") else "")
+            pb_line = (f"⭐ <b>눌림목 패턴</b> (박스 하단 · 급증일 ▲{r['spike_up']}일 · "
+                       f"60일선 엄격 상승 · 종가 60일선 대비 {r['ma_gap']:+.1f}%)\n" if r.get("pullback") else "")
             strong_line = (f"{icon_t} <b>{label_t}: 조건{'·'.join(map(str, r['hits']))}</b>\n"
                            if icon_t else "")
             blocks.append(
                 f"{mark}<b>{n}. {esc(r['name'])}</b> ({esc(r['code'])})\n"
                 f"{strong_line}"
+                f"{pb_line}"
                 f"💰 {r['close']:,}원  ·  📦 박스폭 {r['box']:.1f}%\n"
                 f"🧭 박스 위치 {r['box_pos']:.0f}% ({box_label(r['box_pos'])})\n"
                 f"{detail_line(k, r)}\n"
@@ -640,6 +677,8 @@ def send_condition_messages(results, total, nodata, base_date):
             footer.append(f"… 외 {len(items) - len(shown)}종목 (상위 {len(shown)}개만 표시)")
         if k == 3:
             footer.append("🔴 = 조건 3개 모두 충족 / 🟠 = 조건 2개 충족 (규칙 기반 신호)\n"
+                          f"⭐ = 눌림목 패턴: 박스 하단({PULLBACK_BOX_MAX}%↓) + 급증일 ▲{PULLBACK_SPIKE_UP_MIN}일↑ "
+                          f"+ 60일선 엄격 상승 + 종가 60일선 ±{PULLBACK_MA_GAP:g}% 이내\n"
                           "🧭 박스 위치: 0%=박스 하단, 100%=박스 상단 (종가 기준)\n"
                           "📊 급증일 방향: 거래량 급증일 종가가 전일보다 올랐으면 ▲, 내렸으면 ▼\n"
                           f"📈 60일선: 20일 변화율 ±{MA_FLAT_PCT:g}% 기준 / "
@@ -724,6 +763,8 @@ def main():
         except Exception as e:
             print("60일선 분석 오류", r["code"], e)
             r["ma_label"] = "부족"
+        r["pullback"] = is_pullback(r)
+    print("⭐ 눌림목 패턴:", sum(1 for r in results if r["pullback"]), "종목")
 
     # 성과 기록 저장 + 과거 알림 종목 수익률 갱신
     perf_msg = None
