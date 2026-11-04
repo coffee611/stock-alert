@@ -1,0 +1,29 @@
+name: stock-alert
+
+on:
+  schedule:
+    # GitHub 시간은 UTC(한국시간 -9시간)
+    - cron: "20 23 * * 0-4"   # 한국시간 월~금 08:20 시작 -> 계산 후 08:50에 전송
+    - cron: "0 10 * * 1-5"    # 한국시간 월~금 19:00
+  workflow_dispatch:           # 수동 실행 버튼 (테스트용)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: pip install requests pandas lxml holidays
+
+      - name: Run alert
+        run: python stock_alert.py
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' }}
