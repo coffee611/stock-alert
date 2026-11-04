@@ -7,10 +7,19 @@ on:
     - cron: "0 10 * * 1-5"    # 한국시간 월~금 19:00
   workflow_dispatch:           # 수동 실행 버튼 (테스트용)
 
+# 성과 기록 파일(history/alerts.csv)을 저장소에 자동 저장하기 위한 권한
+permissions:
+  contents: write
+
+# 아침/저녁 실행이 겹쳐도 기록 파일이 꼬이지 않도록 한 번에 하나만 실행
+concurrency:
+  group: stock-alert
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -27,3 +36,13 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Save history
+        if: always()
+        run: |
+          if [ -f history/alerts.csv ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add history/alerts.csv
+            git diff --cached --quiet || (git commit -m "update alert history" && git push)
+          fi
