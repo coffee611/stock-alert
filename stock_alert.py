@@ -2,12 +2,14 @@
 """
 박스권 + 거래량 증가 종목 텔레그램 알림 (GitHub Actions용)
 데이터 출처 : 네이버 증권 (m.stock.naver.com 공개 JSON 주소, 비공식)
-  - 종목 목록 : 시가총액 순위
+  - 종목 목록 : 시가총액 순위 (ETF/ETN/레버리지/인버스/스팩/리츠 제외)
   - 종가/거래량/기관 순매수량 : 종목별 투자자 동향
+알림 : 조건 1, 2, 3 각각 별도의 텔레그램 메시지 (기관 순매수 큰 순)
 """
 import os
 import re
 import time
+import html as htmllib
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -19,11 +21,15 @@ import pandas as pd
 # =====================================================================
 WINDOW = 20             # 분석 기간 (거래일)
 BOX_MAX_RANGE = 0.20    # 박스권: 20일 종가 (최고-최저)/최저 가 20% 이하
-COND2_RATIO = 0.20      # 조건2: 후반10일 평균이 전반10일 평균보다 20% 이상 증가
-COND3_DAYS = 12         # 조건3: 전일 대비 거래량 증가일 12일 이상
-COND4_MULT = 2.0        # 조건4: 20일 평균의 2배 이상 터진 날 1회 이상
+
+COND1_RATIO = 0.30      # 조건1: 후반10일 평균 거래량이 전반10일 평균보다 30% 이상 증가
+COND2_STREAK = 10       # 조건2: 전일 대비 거래량이 '연속'으로 증가한 날 10일 이상
+COND3_MULT = 2.0        # 조건3: 20일 평균 거래량의 2배 이상 터진 날이
+COND3_COUNT = 3         #        3회 이상
+
 USE_INSTITUTION = True  # True: 기관 20일 누적 순매수량이 플러스인 종목만
 PER_MARKET_COUNT = 400  # 코스피/코스닥 각각 시가총액 상위 몇 종목을 검사할지
+MAX_PER_CONDITION = 30  # 조건별 메시지에 표시할 최대 종목 수
 REQUEST_GAP = 0.3       # 요청 간격(초) - 너무 빠르면 차단될 수 있음
 # =====================================================================
 
@@ -42,6 +48,22 @@ HEADERS = {
 }
 LAST_INFO = {"msg": "", "keys": ""}  # 실패 원인 기록 (진단용)
 CODE_RE = re.compile(r"^[0-9A-Z]{6}$")
+
+# ETF/ETN/레버리지/스팩/리츠 제외용 이름 규칙
+EXCLUDE_PREFIX = ("KODEX", "TIGER", "ACE ", "SOL ", "RISE ", "KBSTAR", "HANARO",
+                  "ARIRANG", "KOSEF", "PLUS ", "TIMEFOLIO", "WON ", "1Q ", "KIWOOM ",
+                  "TRUSTON", "마이티", "히어로즈", "파워 ", "BNK ", "HK ")
+EXCLUDE_WORD = ("ETN", "ETF", "레버리지", "인버스", "선물", "커버드콜", "스팩", "SPAC",
+                "리츠", "REIT")
+
+
+def is_excluded(name, type_text=""):
+    n = name.upper()
+    if type_text.lower() in ("etf", "etn", "elw"):
+        return True
+    if n.startswith(tuple(p.upper() for p in EXCLUDE_PREFIX)):
+        return True
+    return any(w.upper() in n for w in EXCLUDE_WORD)
 
 
 # ---------------------------------------------------------------- 공통 도우미
@@ -122,7 +144,7 @@ def inst_value(d):
 
 # ---------------------------------------------------------------- 종목 목록
 def get_universe():
-    stocks, seen = [], set()
+    stocks, seen, skipped = [], set(), 0
     pages = (PER_MARKET_COUNT + 99) // 100
     for market in ("KOSPI", "KOSDAQ"):
         for page in range(1, pages + 1):
@@ -135,9 +157,15 @@ def get_universe():
             for d in lst:
                 code = str(pick(d, ["itemCode", "stockCode", "code", "symbolCode"]) or "")
                 name = str(pick(d, ["stockName", "itemName", "name"]) or code)
-                if CODE_RE.match(code) and code not in seen:
-                    seen.add(code)
-                    stocks.append((code, name))
+                tp = str(pick(d, ["stockEndType", "stockType", "endType", "typeCode"]) or "")
+                if not CODE_RE.match(code) or code in seen:
+                    continue
+                seen.add(code)
+                if is_excluded(name, tp):
+                    skipped += 1
+                    continue
+                stocks.append((code, name))
+    print(f"ETF/레버리지/스팩/리츠 등 제외: {skipped}개")
     return stocks
 
 
@@ -182,6 +210,14 @@ def get_rows(code):
 
 
 # ---------------------------------------------------------------- 조건 판단
+def longest_streak(flags):
+    best = cur = 0
+    for f in flags:
+        cur = cur + 1 if f else 0
+        best = max(best, cur)
+    return best
+
+
 def analyze(code, name):
     """반환: (결과dict 또는 None, 데이터상태 'ok'/'nodata', 기준일)"""
     d21 = get_rows(code)
@@ -204,14 +240,14 @@ def analyze(code, name):
     v21, v20 = d21["vol"], d20["vol"]
     hits = []
     ratio = v20.iloc[10:].mean() / v20.iloc[:10].mean() - 1
-    if ratio >= COND2_RATIO:
+    if ratio >= COND1_RATIO:
+        hits.append(1)
+    streak = longest_streak((v21.diff().iloc[1:] > 0).tolist())
+    if streak >= COND2_STREAK:
         hits.append(2)
-    up_days = int((v21.diff().iloc[1:] > 0).sum())
-    if up_days >= COND3_DAYS:
+    spikes = int((v20 >= v20.mean() * COND3_MULT).sum())
+    if spikes >= COND3_COUNT:
         hits.append(3)
-    spikes = int((v20 >= v20.mean() * COND4_MULT).sum())
-    if spikes >= 1:
-        hits.append(4)
     if not hits:
         return None, "ok", last_date
 
@@ -227,65 +263,128 @@ def analyze(code, name):
     return {
         "code": code, "name": name, "hits": hits,
         "box": (hi - lo) / lo * 100, "ratio": ratio * 100,
-        "up_days": up_days, "spikes": spikes,
+        "streak": streak, "spikes": spikes,
         "close": int(d20["close"].iloc[-1]),
-        "inst_qty": inst_sum, "inst_amt": inst_amt,
+        "inst_qty": 0 if pd.isna(inst_sum) else inst_sum,
+        "inst_amt": 0 if pd.isna(inst_amt) else inst_amt,
     }, "ok", last_date
 
 
 # ---------------------------------------------------------------- 텔레그램
-def send_telegram(text):
+def tg_send(text, use_html=False):
     if not TG_TOKEN or not TG_CHAT_ID:
         print("[오류] 텔레그램 토큰/채팅ID(Secrets)가 설정되지 않았습니다.")
         print(text)
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    chunks, cur = [], ""
-    for line in text.split("\n"):
-        if len(cur) + len(line) > 3800:
+    data = {"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    if use_html:
+        data["parse_mode"] = "HTML"
+    try:
+        r = requests.post(url, data=data, timeout=15)
+        if r.status_code == 200:
+            print("텔레그램 전송 성공")
+        else:
+            print("텔레그램 전송 실패:", r.status_code, r.text)
+    except Exception as e:
+        print("텔레그램 전송 실패:", e)
+    time.sleep(1)
+
+
+def send_plain(text):
+    """오류/안내용 일반 텍스트 메시지"""
+    tg_send(text[:3800], use_html=False)
+
+
+def send_blocks(header, blocks, footer=""):
+    """제목 + 종목 블록들을 4000자 이하로 나눠 전송"""
+    chunks, cur = [], header
+    for b in blocks:
+        if len(cur) + len(b) + 2 > 3500:
             chunks.append(cur)
-            cur = ""
-        cur += line + "\n"
+            cur = "(이어서)\n"
+        cur += "\n" + b
+    if footer:
+        cur += "\n\n" + footer
     chunks.append(cur)
     for c in chunks:
-        try:
-            r = requests.post(url, data={"chat_id": TG_CHAT_ID, "text": c}, timeout=15)
-            if r.status_code == 200:
-                print("텔레그램 전송 성공")
-            else:
-                print("텔레그램 전송 실패:", r.status_code, r.text)
-        except Exception as e:
-            print("텔레그램 전송 실패:", e)
+        tg_send(c, use_html=True)
 
 
-def build_message(results, total, nodata, base_date):
+def esc(s):
+    return htmllib.escape(str(s))
+
+
+COND_INFO = {
+    1: ("🟢", "조건1", f"후반10일 평균 거래량이 전반10일보다 {COND1_RATIO*100:.0f}% 이상 증가"),
+    2: ("🟡", "조건2", f"거래량이 전일 대비 연속 {COND2_STREAK}일 이상 증가"),
+    3: ("🔴", "조건3", f"20일 평균 거래량의 {COND3_MULT:g}배 이상 터진 날 {COND3_COUNT}회 이상"),
+}
+
+
+def tier(r):
+    """동시 충족 조건 수에 따른 강조 단계: 3개=🔴, 2개=🟠, 1개=없음"""
+    n = len(r["hits"])
+    if n >= 3:
+        return "🔴", "3개 조건 모두 충족"
+    if n == 2:
+        return "🟠", "2개 조건 충족"
+    return "", ""
+
+
+def detail_line(k, r):
+    if k == 1:
+        return f"📈 거래량 후반/전반 <b>{r['ratio']:+.0f}%</b>"
+    if k == 2:
+        return f"📈 거래량 연속 증가 <b>{r['streak']}일</b>"
+    return f"📈 평균 {COND3_MULT:g}배↑ 급증일 <b>{r['spikes']}회</b>"
+
+
+def send_condition_messages(results, total, nodata, base_date):
     now = dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    titles = {
-        2: "[조건2] 박스권 + 후반10일 평균 거래량 20%↑",
-        3: f"[조건3] 박스권 + 전일대비 증가일 {COND3_DAYS}일↑",
-        4: f"[조건4] 박스권 + 20일 평균 {COND4_MULT:.0f}배 터진 날 1회↑",
-    }
-    msg = [f"📊 수급 박스권 알림 ({now})",
-           f"데이터 기준일: {base_date}",
-           f"검사 {total}종목 / 해당 {len(results)}종목",
-           "출처: 네이버 증권 (종가·거래량·기관 순매수량)", ""]
-    for k in (2, 3, 4):
+    for k in (1, 2, 3):
+        icon, title, desc = COND_INFO[k]
         items = [r for r in results if k in r["hits"]]
-        msg.append(f"{titles[k]}  ({len(items)}개)")
-        if not items:
-            msg.append("  - 해당 종목 없음")
-        for r in items:
-            msg.append(
-                f"  • {r['name']}({r['code']}) {r['close']:,}원\n"
-                f"    박스폭 {r['box']:.1f}% | 후반/전반 {r['ratio']:+.0f}% | "
-                f"증가일 {r['up_days']}일 | 급증일 {r['spikes']}회\n"
-                f"    기관 20일 순매수 {r['inst_qty']:,.0f}주 (약 {r['inst_amt']:+,.0f}억원, 추정)")
-        msg.append("")
-    if nodata:
-        msg.append(f"⚠ 자료 미흡/수집 실패로 제외된 종목: {nodata}개")
-    msg.append("※ 거래대금은 제공되지 않아 거래량만 사용했습니다.")
-    msg.append("※ 투자 판단과 책임은 본인에게 있습니다.")
-    return "\n".join(msg)
+        items.sort(key=lambda r: r["inst_amt"], reverse=True)  # 기관 순매수 큰 순
+        shown = items[:MAX_PER_CONDITION]
+        n3 = sum(1 for r in items if len(r["hits"]) >= 3)
+        n2 = sum(1 for r in items if len(r["hits"]) == 2)
+        tier_txt = ""
+        if n3 or n2:
+            parts = ([f"🔴 3개충족 {n3}"] if n3 else []) + ([f"🟠 2개충족 {n2}"] if n2 else [])
+            tier_txt = " (" + " · ".join(parts) + ")"
+
+        header = (f"{icon} <b>{title}</b> | {esc(desc)}\n"
+                  f"🕘 {now}  |  📅 기준일 {esc(base_date)}\n"
+                  f"🔎 검사 {total}종목 → <b>해당 {len(items)}종목</b>"
+                  f"{tier_txt}\n"
+                  f"↕ 기관 순매수 큰 순 정렬\n"
+                  f"━━━━━━━━━━━━━━")
+        blocks = []
+        for n, r in enumerate(shown, 1):
+            icon_t, label_t = tier(r)
+            mark = f"{icon_t} " if icon_t else ""
+            strong_line = (f"{icon_t} <b>{label_t}: 조건{'·'.join(map(str, r['hits']))}</b>\n"
+                           if icon_t else "")
+            blocks.append(
+                f"{mark}<b>{n}. {esc(r['name'])}</b> ({esc(r['code'])})\n"
+                f"{strong_line}"
+                f"💰 {r['close']:,}원  ·  📦 박스폭 {r['box']:.1f}%\n"
+                f"{detail_line(k, r)}\n"
+                f"🏦 기관 20일 순매수 <b>{r['inst_amt']:+,.0f}억</b> ({r['inst_qty']:+,.0f}주)\n"
+                f"──────────────")
+        if not blocks:
+            blocks.append("해당 종목이 없습니다.")
+        footer = []
+        if len(items) > len(shown):
+            footer.append(f"… 외 {len(items) - len(shown)}종목 (상위 {len(shown)}개만 표시)")
+        if k == 3:
+            if nodata:
+                footer.append(f"⚠ 자료 미흡/수집 실패 제외: {nodata}개")
+            footer.append("🔴 = 조건 3개 모두 충족 / 🟠 = 조건 2개 충족 (규칙 기반 신호)\n"
+                          "※ ETF·레버리지·스팩·리츠 제외 / 거래대금 미제공(거래량 기준)\n"
+                          "※ 투자 판단과 책임은 본인에게 있습니다.")
+        send_blocks(header, blocks, "\n".join(footer))
 
 
 # ---------------------------------------------------------------- 실행
@@ -325,7 +424,7 @@ def main():
         return
     stocks = get_universe()
     if not stocks:
-        send_telegram(fail_message("네이버 증권에서 종목 목록을 가져오지 못했습니다."))
+        send_plain(fail_message("네이버 증권에서 종목 목록을 가져오지 못했습니다."))
         return
     print("검사 종목 수:", len(stocks))
 
@@ -343,17 +442,17 @@ def main():
         if r:
             results.append(r)
         if i == 30 and nodata >= 28:  # 처음부터 거의 다 실패 -> 빨리 중단하고 원인 알림
-            send_telegram(fail_message("종목별 데이터를 거의 읽지 못해 중단했습니다."))
+            send_plain(fail_message("종목별 데이터를 거의 읽지 못해 중단했습니다."))
             return
         if i % 100 == 0:
             print(f"  진행 {i}/{len(stocks)}")
 
     if nodata > len(stocks) * 0.5:
-        send_telegram(fail_message(f"데이터 수집 실패가 많습니다 ({nodata}/{len(stocks)})."))
+        send_plain(fail_message(f"데이터 수집 실패가 많습니다 ({nodata}/{len(stocks)})."))
         return
     base_date = max(base_dates) if base_dates else "알 수 없음"
     wait_until_0850()
-    send_telegram(build_message(results, len(stocks), nodata, base_date))
+    send_condition_messages(results, len(stocks), nodata, base_date)
     print("완료. 해당 종목:", len(results))
 
 
