@@ -5,6 +5,8 @@
   - 종목 목록 : 시가총액 순위 (ETF/ETN/레버리지/인버스/스팩/리츠 제외)
   - 종가/거래량/기관 순매수량 : 종목별 투자자 동향
 알림 : 조건 1, 2, 3 각각 별도의 텔레그램 메시지 (기관 순매수 큰 순)
+추가 정보 : 박스 안 위치 / 급증일 가격 방향 / 60일선 방향(단순+엄격)
+성과 기록 : history/alerts.csv 에 알림 종목을 저장하고 5·10·20일 뒤 수익률을 자동 계산
 """
 import os
 import re
@@ -23,14 +25,21 @@ WINDOW = 20             # 분석 기간 (거래일)
 BOX_MAX_RANGE = 0.20    # 박스권: 20일 종가 (최고-최저)/최저 가 20% 이하
 
 COND1_RATIO = 0.30      # 조건1: 후반10일 평균 거래량이 전반10일 평균보다 30% 이상 증가
-COND2_STREAK = 7       # 조건2: 전일 대비 거래량이 '연속'으로 증가한 날 7일 이상
+COND2_STREAK = 7        # 조건2: 전일 대비 거래량이 '중간에 끊기지 않고' 연속 증가한 일수
 COND3_MULT = 2.0        # 조건3: 20일 평균 거래량의 2배 이상 터진 날이
 COND3_COUNT = 3         #        3회 이상
+
+MA_PERIOD = 60          # 이동평균선 기간
+MA_FLAT_PCT = 2.0       # 60일선 20일 변화율이 ±2% 이내면 '횡보'
+MA_STRICT_DAYS = 14     # 엄격 기준: 20일 중 60일선이 전일보다 오른(내린) 날이 14일(70%) 이상
 
 USE_INSTITUTION = True  # True: 기관 20일 누적 순매수량이 플러스인 종목만
 PER_MARKET_COUNT = 400  # 코스피/코스닥 각각 시가총액 상위 몇 종목을 검사할지
 MAX_PER_CONDITION = 30  # 조건별 메시지에 표시할 최대 종목 수
 REQUEST_GAP = 0.3       # 요청 간격(초) - 너무 빠르면 차단될 수 있음
+
+HISTORY_PATH = "history/alerts.csv"  # 성과 기록 파일
+MIN_SAMPLE = 5          # 성과 통계를 보여주기 위한 최소 표본 수
 # =====================================================================
 
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
@@ -209,6 +218,33 @@ def get_rows(code):
     return None
 
 
+def get_history(code, need):
+    """종가 이력(오래된 날짜 -> 최신) 최소 need일치. 후보 종목에만 사용. 실패 시 None"""
+    rows = []
+    df = None
+    for page in (1, 2, 3):
+        data = get_json(f"{M_BASE}/api/stock/{code}/price?pageSize=60&page={page}", retry=2)
+        lst = find_list(data) if data is not None else []
+        if not lst:
+            break
+        rows += lst
+        df = rows_to_df(rows)
+        df = df[df["close"].notna()]
+        if len(df) >= need:
+            break
+    if df is None or len(df) < need:
+        data = get_json(f"{M_BASE}/api/stock/{code}/trend?pageSize={need}&page=1", retry=2)
+        lst = find_list(data) if data is not None else []
+        if lst:
+            df2 = rows_to_df(lst)
+            df2 = df2[df2["close"].notna()]
+            if df is None or len(df2) > len(df):
+                df = df2
+    if df is None or df.empty:
+        return None
+    return df.sort_values("date").reset_index(drop=True)
+
+
 # ---------------------------------------------------------------- 조건 판단
 def longest_streak(flags):
     best = cur = 0
@@ -245,7 +281,8 @@ def analyze(code, name):
     streak = longest_streak((v21.diff().iloc[1:] > 0).tolist())
     if streak >= COND2_STREAK:
         hits.append(2)
-    spikes = int((v20 >= v20.mean() * COND3_MULT).sum())
+    mask = (v20 >= v20.mean() * COND3_MULT).values
+    spikes = int(mask.sum())
     if spikes >= COND3_COUNT:
         hits.append(3)
     if not hits:
@@ -260,14 +297,206 @@ def analyze(code, name):
         if inst_sum <= 0:
             return None, "ok", last_date
 
+    # 급증일의 가격 방향 (급증일 종가가 전일보다 올랐는지/내렸는지)
+    closes21 = d21["close"].values
+    up = dn = 0
+    for j in range(WINDOW):
+        if mask[j]:
+            if closes21[j + 1] > closes21[j]:
+                up += 1
+            elif closes21[j + 1] < closes21[j]:
+                dn += 1
+    if spikes == 0:
+        spike_dir = "없음"
+    elif up > dn:
+        spike_dir = "매수세 우위"
+    elif dn > up:
+        spike_dir = "매도세 우위"
+    else:
+        spike_dir = "중립"
+
+    close = float(d20["close"].iloc[-1])
+    box_pos = 50.0 if hi == lo else (close - lo) / (hi - lo) * 100
+
     return {
-        "code": code, "name": name, "hits": hits,
-        "box": (hi - lo) / lo * 100, "ratio": ratio * 100,
-        "streak": streak, "spikes": spikes,
-        "close": int(d20["close"].iloc[-1]),
+        "code": code, "name": name, "hits": hits, "date": last_date,
+        "box": (hi - lo) / lo * 100, "box_pos": box_pos,
+        "ratio": ratio * 100, "streak": streak, "spikes": spikes,
+        "spike_up": up, "spike_dn": dn, "spike_dir": spike_dir,
+        "close": int(close),
         "inst_qty": 0 if pd.isna(inst_sum) else inst_sum,
         "inst_amt": 0 if pd.isna(inst_amt) else inst_amt,
+        "ma_label": None, "ma_chg": None, "ma_up_days": None,
+        "ma_dn_days": None, "ma_strict": "", "above_ma": None,
     }, "ok", last_date
+
+
+# ---------------------------------------------------------------- 60일선 분석 (후보 종목만)
+def enrich_ma(r):
+    """60일선 방향(단순: 20일 변화율 / 엄격: 20일 중 상승일 수)과 종가 위치"""
+    need = MA_PERIOD + WINDOW  # 80일치
+    df = get_history(r["code"], need)
+    if df is None or len(df) < MA_PERIOD:
+        r["ma_label"] = "부족"
+        return
+    close = df["close"].reset_index(drop=True)
+    ma = close.rolling(MA_PERIOD).mean()
+    r["above_ma"] = bool(close.iloc[-1] >= ma.iloc[-1])
+    if len(df) < need:
+        r["ma_label"] = "부족"
+        return
+    chg = (ma.iloc[-1] / ma.iloc[-(WINDOW + 1)] - 1) * 100
+    diffs = ma.diff().iloc[-WINDOW:]
+    up_days, dn_days = int((diffs > 0).sum()), int((diffs < 0).sum())
+    r["ma_chg"], r["ma_up_days"], r["ma_dn_days"] = chg, up_days, dn_days
+    if chg >= MA_FLAT_PCT:
+        r["ma_label"] = "상승"
+    elif chg <= -MA_FLAT_PCT:
+        r["ma_label"] = "하락"
+    else:
+        r["ma_label"] = "횡보"
+    if up_days >= MA_STRICT_DAYS:
+        r["ma_strict"] = "up"
+    elif dn_days >= MA_STRICT_DAYS:
+        r["ma_strict"] = "down"
+
+
+# ---------------------------------------------------------------- 성과 기록
+HIST_COLS = ["base_date", "code", "name", "conds", "n_conds", "close", "box_pos",
+             "ma_label", "ma_chg", "ma_strict", "above_ma", "spike_dir",
+             "inst_amt", "r5", "r10", "r20"]
+NUM_COLS = ["n_conds", "close", "box_pos", "ma_chg", "inst_amt", "r5", "r10", "r20"]
+
+
+def load_history():
+    if os.path.exists(HISTORY_PATH):
+        try:
+            df = pd.read_csv(HISTORY_PATH, encoding="utf-8-sig", dtype=str)
+        except Exception as e:
+            print("성과 기록 읽기 실패:", e)
+            df = pd.DataFrame(columns=HIST_COLS)
+    else:
+        df = pd.DataFrame(columns=HIST_COLS)
+    for c in HIST_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[HIST_COLS].copy()
+    for c in NUM_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in ("base_date", "code", "name", "conds", "ma_label", "ma_strict",
+              "above_ma", "spike_dir"):
+        df[c] = df[c].fillna("").astype(str)
+    return df
+
+
+def save_history(df):
+    os.makedirs(os.path.dirname(HISTORY_PATH) or ".", exist_ok=True)
+    df.to_csv(HISTORY_PATH, index=False, encoding="utf-8-sig")
+
+
+def record_history(df, results):
+    """오늘 알림 종목을 기록 (같은 기준일+종목은 한 번만)"""
+    seen = set(zip(df["base_date"], df["code"]))
+    rows = []
+    for r in results:
+        key = (r["date"], r["code"])
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "base_date": r["date"], "code": r["code"], "name": r["name"],
+            "conds": ",".join(map(str, r["hits"])), "n_conds": len(r["hits"]),
+            "close": r["close"], "box_pos": round(r["box_pos"], 1),
+            "ma_label": r["ma_label"] or "", "ma_chg": (round(r["ma_chg"], 2)
+                                                        if r["ma_chg"] is not None else None),
+            "ma_strict": r["ma_strict"], "above_ma": "" if r["above_ma"] is None
+            else ("Y" if r["above_ma"] else "N"),
+            "spike_dir": r["spike_dir"], "inst_amt": round(r["inst_amt"], 1),
+            "r5": None, "r10": None, "r20": None,
+        })
+    if rows:
+        df = pd.concat([df, pd.DataFrame(rows, columns=HIST_COLS)], ignore_index=True)
+        for c in NUM_COLS:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def update_returns(df):
+    """알림일 종가 대비 5/10/20거래일 뒤 수익률을 채움 (아직 비어 있는 것만)"""
+    today = dt.datetime.now(KST).date()
+    pending = []
+    for idx, row in df.iterrows():
+        if not pd.isna(row["r20"]):
+            continue
+        try:
+            age = (today - dt.date.fromisoformat(row["base_date"])).days
+        except Exception:
+            continue
+        if 7 <= age <= 60:
+            pending.append(idx)
+    if not pending:
+        return df
+    for code in sorted(set(df.loc[pending, "code"])):
+        hist = get_history(code, 70)
+        if hist is None:
+            continue
+        dates, closes = list(hist["date"]), list(hist["close"])
+        for idx in [i for i in pending if df.at[i, "code"] == code]:
+            bd = df.at[idx, "base_date"].replace("-", "")
+            if bd not in dates:
+                continue
+            i0 = dates.index(bd)
+            base = closes[i0]
+            if not base or pd.isna(base):
+                continue
+            for n, col in ((5, "r5"), (10, "r10"), (20, "r20")):
+                if pd.isna(df.at[idx, col]) and i0 + n < len(closes):
+                    df.at[idx, col] = round((closes[i0 + n] / base - 1) * 100, 2)
+    return df
+
+
+def stats_line(label, sub):
+    parts = []
+    for col, nm in (("r5", "5일"), ("r10", "10일"), ("r20", "20일")):
+        s = sub[col].dropna()
+        if len(s) < MIN_SAMPLE:
+            parts.append(f"{nm} 표본부족({len(s)})")
+        else:
+            parts.append(f"{nm} {s.mean():+.1f}% (승률 {(s > 0).mean() * 100:.0f}%, n={len(s)})")
+    return f"<b>{esc(label)}</b>\n   " + " | ".join(parts)
+
+
+def build_performance_message(df):
+    ev = df[df["r5"].notna()]
+    if ev.empty:
+        return None
+
+    def has_cond(k):
+        return df["conds"].apply(lambda s: str(k) in str(s).split(","))
+
+    groups = [
+        ("전체 알림 종목", df),
+        ("조건1", df[has_cond(1)]), ("조건2", df[has_cond(2)]), ("조건3", df[has_cond(3)]),
+        ("🔴 3개 조건 충족", df[df["n_conds"] >= 3]),
+        ("🟠 2개 조건 충족", df[df["n_conds"] == 2]),
+        ("60일선 상승", df[df["ma_label"] == "상승"]),
+        ("60일선 횡보", df[df["ma_label"] == "횡보"]),
+        ("60일선 하락", df[df["ma_label"] == "하락"]),
+        ("60일선 엄격 상승", df[df["ma_strict"] == "up"]),
+        ("급증일 매수세 우위", df[df["spike_dir"] == "매수세 우위"]),
+        ("급증일 매도세 우위", df[df["spike_dir"] == "매도세 우위"]),
+        ("박스 상단(67%↑)", df[df["box_pos"] >= 67]),
+        ("박스 하단(33%↓)", df[df["box_pos"] <= 33]),
+    ]
+    lines = ["📈 <b>성과 기록</b> | 과거 알림 종목의 이후 수익률",
+             f"누적 기록 {len(df)}건 / 5일 경과 {len(ev)}건",
+             "알림 기준일 종가 대비 · 수수료/세금 미반영",
+             "━━━━━━━━━━━━━━"]
+    for label, sub in groups:
+        lines.append(stats_line(label, sub))
+    lines.append("")
+    lines.append("※ 표본이 적으면 우연일 수 있습니다. 참고용이며 매수 추천이 아닙니다.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- 텔레그램
@@ -317,7 +546,7 @@ def esc(s):
 
 COND_INFO = {
     1: ("🟢", "조건1", f"후반10일 평균 거래량이 전반10일보다 {COND1_RATIO*100:.0f}% 이상 증가"),
-    2: ("🟡", "조건2", f"거래량이 전일 대비 연속 {COND2_STREAK}일 이상 증가"),
+    2: ("🟡", "조건2", f"거래량이 전일 대비 끊기지 않고 연속 {COND2_STREAK}일 이상 증가"),
     3: ("🔴", "조건3", f"20일 평균 거래량의 {COND3_MULT:g}배 이상 터진 날 {COND3_COUNT}회 이상"),
 }
 
@@ -332,12 +561,40 @@ def tier(r):
     return "", ""
 
 
+def box_label(pos):
+    return "하단" if pos < 33 else ("중단" if pos < 67 else "상단")
+
+
 def detail_line(k, r):
     if k == 1:
         return f"📈 거래량 후반/전반 <b>{r['ratio']:+.0f}%</b>"
     if k == 2:
         return f"📈 거래량 연속 증가 <b>{r['streak']}일</b>"
-    return f"📈 평균 {COND3_MULT:g}배↑ 급증일 <b>{r['spikes']}회</b>"
+    return (f"📈 평균 {COND3_MULT:g}배↑ 급증일 <b>{r['spikes']}회</b> "
+            f"(▲{r['spike_up']} ▼{r['spike_dn']} → <b>{r['spike_dir']}</b>)")
+
+
+def spike_line(r):
+    if r["spikes"] < 1:
+        return ""
+    return (f"📊 급증일 {r['spikes']}회: ▲{r['spike_up']} ▼{r['spike_dn']} "
+            f"→ <b>{r['spike_dir']}</b>\n")
+
+
+def ma_line(r):
+    lab = r.get("ma_label")
+    pos = ""
+    if r.get("above_ma") is not None:
+        pos = " · 종가 60일선 " + ("위" if r["above_ma"] else "아래")
+    if lab in (None, "부족"):
+        return f"📈 60일선 방향 판정 불가(데이터 부족){pos}\n"
+    icon = {"상승": "📈", "횡보": "➖", "하락": "📉"}[lab]
+    s = f"{icon} 60일선 <b>{lab}</b> ({r['ma_chg']:+.1f}%) · 20일 중 {r['ma_up_days']}일 상승"
+    if r["ma_strict"] == "up":
+        s += " ✅엄격 상승"
+    elif r["ma_strict"] == "down":
+        s += " ⚠엄격 하락"
+    return s + pos + "\n"
 
 
 def send_condition_messages(results, total, nodata, base_date):
@@ -370,7 +627,10 @@ def send_condition_messages(results, total, nodata, base_date):
                 f"{mark}<b>{n}. {esc(r['name'])}</b> ({esc(r['code'])})\n"
                 f"{strong_line}"
                 f"💰 {r['close']:,}원  ·  📦 박스폭 {r['box']:.1f}%\n"
+                f"🧭 박스 위치 {r['box_pos']:.0f}% ({box_label(r['box_pos'])})\n"
                 f"{detail_line(k, r)}\n"
+                f"{spike_line(r) if k != 3 else ''}"
+                f"{ma_line(r)}"
                 f"🏦 기관 20일 순매수 <b>{r['inst_amt']:+,.0f}억</b> ({r['inst_qty']:+,.0f}주)\n"
                 f"──────────────")
         if not blocks:
@@ -379,10 +639,14 @@ def send_condition_messages(results, total, nodata, base_date):
         if len(items) > len(shown):
             footer.append(f"… 외 {len(items) - len(shown)}종목 (상위 {len(shown)}개만 표시)")
         if k == 3:
+            footer.append("🔴 = 조건 3개 모두 충족 / 🟠 = 조건 2개 충족 (규칙 기반 신호)\n"
+                          "🧭 박스 위치: 0%=박스 하단, 100%=박스 상단 (종가 기준)\n"
+                          "📊 급증일 방향: 거래량 급증일 종가가 전일보다 올랐으면 ▲, 내렸으면 ▼\n"
+                          f"📈 60일선: 20일 변화율 ±{MA_FLAT_PCT:g}% 기준 / "
+                          f"엄격=20일 중 {MA_STRICT_DAYS}일 이상 같은 방향")
             if nodata:
                 footer.append(f"⚠ 자료 미흡/수집 실패 제외: {nodata}개")
-            footer.append("🔴 = 조건 3개 모두 충족 / 🟠 = 조건 2개 충족 (규칙 기반 신호)\n"
-                          "※ ETF·레버리지·스팩·리츠 제외 / 거래대금 미제공(거래량 기준)\n"
+            footer.append("※ ETF·레버리지·스팩·리츠 제외 / 거래대금 미제공(거래량 기준)\n"
                           "※ 투자 판단과 책임은 본인에게 있습니다.")
         send_blocks(header, blocks, "\n".join(footer))
 
@@ -418,9 +682,9 @@ def fail_message(prefix):
 
 
 def main():
-    today = dt.datetime.now(KST).date()
-    if not FORCE and is_market_closed(today):
-        print("휴장일이라 건너뜁니다:", today)
+    now = dt.datetime.now(KST)
+    if not FORCE and is_market_closed(now.date()):
+        print("휴장일이라 건너뜁니다:", now.date())
         return
     stocks = get_universe()
     if not stocks:
@@ -451,8 +715,31 @@ def main():
         send_plain(fail_message(f"데이터 수집 실패가 많습니다 ({nodata}/{len(stocks)})."))
         return
     base_date = max(base_dates) if base_dates else "알 수 없음"
+
+    # 후보 종목에만 60일선 분석 (요청 수를 아끼기 위해)
+    print(f"60일선 분석: {len(results)}종목")
+    for r in results:
+        try:
+            enrich_ma(r)
+        except Exception as e:
+            print("60일선 분석 오류", r["code"], e)
+            r["ma_label"] = "부족"
+
+    # 성과 기록 저장 + 과거 알림 종목 수익률 갱신
+    perf_msg = None
+    try:
+        hist = load_history()
+        hist = record_history(hist, results)
+        hist = update_returns(hist)
+        save_history(hist)
+        perf_msg = build_performance_message(hist)
+    except Exception as e:
+        print("성과 기록 처리 오류:", e)
+
     wait_until_0850()
     send_condition_messages(results, len(stocks), nodata, base_date)
+    if perf_msg and (FORCE or now.hour >= 12):  # 성과 요약은 저녁 알림에만
+        tg_send(perf_msg, use_html=True)
     print("완료. 해당 종목:", len(results))
 
 
