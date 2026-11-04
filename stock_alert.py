@@ -196,7 +196,11 @@ def send_telegram(text):
     chunks.append(cur)
     for c in chunks:
         try:
-            requests.post(url, data={"chat_id": TG_CHAT_ID, "text": c}, timeout=15)
+            r = requests.post(url, data={"chat_id": TG_CHAT_ID, "text": c}, timeout=15)
+            if r.status_code == 200:
+                print("텔레그램 전송 성공")
+            else:
+                print("텔레그램 전송 실패:", r.status_code, r.text)
         except Exception as e:
             print("텔레그램 전송 실패:", e)
 
