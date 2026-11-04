@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 박스권 + 거래량 증가 종목 텔레그램 알림 (GitHub Actions용)
-데이터 출처 : 네이버 금융 (finance.naver.com)
-  - 종목 목록 : 시가총액 순위 페이지
-  - 종가/거래량/기관 순매매량 : 종목별 '외국인·기관 매매' 페이지
+데이터 출처 : 네이버 증권 (m.stock.naver.com 공개 JSON 주소, 비공식)
+  - 종목 목록 : 시가총액 순위
+  - 종가/거래량/기관 순매수량 : 종목별 투자자 동향
 """
 import os
 import re
 import time
 import datetime as dt
-from io import StringIO
 from zoneinfo import ZoneInfo
 
 import requests
@@ -23,67 +22,82 @@ BOX_MAX_RANGE = 0.20    # 박스권: 20일 종가 (최고-최저)/최저 가 20%
 COND2_RATIO = 0.20      # 조건2: 후반10일 평균이 전반10일 평균보다 20% 이상 증가
 COND3_DAYS = 12         # 조건3: 전일 대비 거래량 증가일 12일 이상
 COND4_MULT = 2.0        # 조건4: 20일 평균의 2배 이상 터진 날 1회 이상
-USE_INSTITUTION = True  # True: 기관 20일 누적 순매매량이 플러스인 종목만
-PER_MARKET_PAGES = 8    # 시총 순위 페이지 수 (1페이지=50종목, 코스피/코스닥 각각)
-REQUEST_GAP = 0.25      # 요청 간격(초) - 너무 빠르면 차단될 수 있음
+USE_INSTITUTION = True  # True: 기관 20일 누적 순매수량이 플러스인 종목만
+PER_MARKET_COUNT = 400  # 코스피/코스닥 각각 시가총액 상위 몇 종목을 검사할지
+REQUEST_GAP = 0.3       # 요청 간격(초) - 너무 빠르면 차단될 수 있음
 # =====================================================================
 
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 FORCE = os.environ.get("FORCE", "").lower() == "true"  # 수동 실행이면 휴장 체크 생략
 KST = ZoneInfo("Asia/Seoul")
+M_BASE = "https://m.stock.naver.com"
+S_BASE = "https://stock.naver.com"
 HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-    "Referer": "https://finance.naver.com/",
+    "User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                   "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                   "Mobile/15E148 Safari/604.1"),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://m.stock.naver.com/",
 }
-DATE_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}$")
+LAST_INFO = {"msg": "", "keys": ""}  # 실패 원인 기록 (진단용)
+CODE_RE = re.compile(r"^[0-9A-Z]{6}$")
 
 
-LAST_INFO = {"msg": ""}  # 마지막 실패 원인 기록 (진단용)
-
-
-def http_get(url, retry=3):
+# ---------------------------------------------------------------- 공통 도우미
+def get_json(url, retry=3):
     for i in range(retry):
         try:
             r = requests.get(url, headers=HEADERS, timeout=15)
             time.sleep(REQUEST_GAP)
             if r.status_code == 200:
-                r.encoding = "euc-kr"  # 네이버 금융은 euc-kr
-                return r.text
-            snippet = r.text[:150].replace("\n", " ")
-            LAST_INFO["msg"] = f"HTTP {r.status_code} / {url} / {snippet}"
+                try:
+                    return r.json()
+                except Exception:
+                    LAST_INFO["msg"] = (f"JSON이 아닌 응답 / {url} / "
+                                        + r.text[:120].replace("\n", " "))
+            else:
+                LAST_INFO["msg"] = (f"HTTP {r.status_code} / {url} / "
+                                    + r.text[:120].replace("\n", " "))
+                if r.status_code in (403, 429):  # 차단 신호 -> 재시도하지 않음
+                    print("요청 실패:", LAST_INFO["msg"])
+                    return None
         except Exception as e:
-            LAST_INFO["msg"] = f"접속 오류 {type(e).__name__}: {str(e)[:150]} / {url}"
+            LAST_INFO["msg"] = f"접속 오류 {type(e).__name__}: {str(e)[:120]} / {url}"
         print("요청 실패:", LAST_INFO["msg"])
         time.sleep(1 + i)
     return None
 
 
-# ---------------------------------------------------------------- 종목 목록
-def get_universe():
-    stocks, seen = [], set()
-    pat = re.compile(r'<a href="/item/main\.naver\?code=(\d{6})"[^>]*>([^<]+)</a>')
-    for sosok in (0, 1):  # 0=코스피, 1=코스닥
-        for page in range(1, PER_MARKET_PAGES + 1):
-            html = http_get(f"https://finance.naver.com/sise/sise_market_sum.naver"
-                            f"?sosok={sosok}&page={page}")
-            if not html:
-                continue
-            found = pat.findall(html)
-            if not found:
-                LAST_INFO["msg"] = ("접속은 됐으나 종목을 못 읽음 (화면 구조 변경/차단 페이지 가능성) "
-                                    f"/ 응답 길이 {len(html)} / 앞부분: "
-                                    + html[:150].replace("\n", " "))
-                print(LAST_INFO["msg"])
-            for code, name in found:
-                if code not in seen:
-                    seen.add(code)
-                    stocks.append((code, name.strip()))
-    return stocks
+def find_list(obj):
+    """응답 안에서 '딕셔너리 목록'을 찾아 돌려줌 (응답 모양이 조금 달라도 동작)"""
+    if isinstance(obj, list):
+        if obj and isinstance(obj[0], dict):
+            return obj
+        for v in obj:
+            r = find_list(v)
+            if r:
+                return r
+    elif isinstance(obj, dict):
+        for key in ("stocks", "items", "datas", "data", "result", "list", "rows"):
+            if key in obj:
+                r = find_list(obj[key])
+                if r:
+                    return r
+        for v in obj.values():
+            r = find_list(v)
+            if r:
+                return r
+    return []
 
 
-# ---------------------------------------------------------------- 종목 데이터
+def pick(d, names):
+    for n in names:
+        if n in d and d[n] not in (None, ""):
+            return d[n]
+    return None
+
+
 def to_num(x):
     try:
         return float(str(x).replace(",", "").replace("+", "").strip())
@@ -91,76 +105,103 @@ def to_num(x):
         return float("nan")
 
 
-def fetch_page(code, page):
-    """종목별 일자 데이터 1페이지 -> [(날짜, 종가, 거래량, 기관순매매량), ...] 최신순"""
-    html = http_get(f"https://finance.naver.com/item/frgn.naver?code={code}&page={page}")
-    if not html:
-        return None
-    try:
-        tables = pd.read_html(StringIO(html))
-    except Exception:
-        return None
-    for t in tables:
-        if t.shape[1] < 6:
-            continue
-        first = t.iloc[:, 0].astype(str).str.strip()
-        rows = t[first.str.match(DATE_RE)]
-        if rows.empty:
-            continue
-        out = []
-        for _, r in rows.iterrows():
-            # 열 순서: 날짜, 종가, 전일비, 등락률, 거래량, 기관 순매매량, 외국인 ...
-            out.append((str(r.iloc[0]).strip(), to_num(r.iloc[1]),
-                        to_num(r.iloc[4]), to_num(r.iloc[5])))
-        return out
+def inst_value(d):
+    """기관 순매수량 항목을 이름으로 찾음"""
+    v = pick(d, ["organPureBuyQuant", "organizationPureBuyQuant",
+                 "orgnPureBuyQuant", "institutionPureBuyQuant"])
+    if v is not None:
+        return v
+    for k, val in d.items():
+        kl = k.lower()
+        if (("organ" in kl or "orgn" in kl or "institution" in kl)
+                and ("buy" in kl or "quant" in kl or "qty" in kl)
+                and "ratio" not in kl and "amount" not in kl):
+            return val
     return None
 
 
-class Rows:
-    """필요한 만큼만 페이지를 가져오는 도우미 (불필요한 요청 줄이기)"""
-    def __init__(self, code):
-        self.code, self.page, self.rows, self.ok = code, 0, [], True
-
-    def ensure(self, n):
-        while len(self.rows) < n and self.page < 4 and self.ok:
-            self.page += 1
-            got = fetch_page(self.code, self.page)
-            if not got:
-                self.ok = False
+# ---------------------------------------------------------------- 종목 목록
+def get_universe():
+    stocks, seen = [], set()
+    pages = (PER_MARKET_COUNT + 99) // 100
+    for market in ("KOSPI", "KOSDAQ"):
+        for page in range(1, pages + 1):
+            data = get_json(f"{M_BASE}/api/stocks/marketValue/{market}"
+                            f"?page={page}&pageSize=100")
+            lst = find_list(data) if data is not None else []
+            if not lst:
+                LAST_INFO["msg"] = LAST_INFO["msg"] or f"종목 목록이 비어 있음 ({market} {page}페이지)"
                 break
-            self.rows += got
-        df = pd.DataFrame(self.rows, columns=["date", "close", "vol", "inst"])
-        df = df.drop_duplicates("date").sort_values("date").reset_index(drop=True)
-        return df if len(df) >= n else None
+            for d in lst:
+                code = str(pick(d, ["itemCode", "stockCode", "code", "symbolCode"]) or "")
+                name = str(pick(d, ["stockName", "itemName", "name"]) or code)
+                if CODE_RE.match(code) and code not in seen:
+                    seen.add(code)
+                    stocks.append((code, name))
+    return stocks
+
+
+# ---------------------------------------------------------------- 종목 데이터
+def rows_to_df(lst):
+    out = []
+    for d in lst:
+        date = re.sub(r"\D", "", str(pick(d, ["bizdate", "localTradedAt", "tradeDate",
+                                              "date", "businessDate"]) or ""))
+        out.append((date,
+                    to_num(pick(d, ["closePrice", "close"])),
+                    to_num(pick(d, ["accumulatedTradingVolume", "tradingVolume", "volume"])),
+                    to_num(inst_value(d))))
+    df = pd.DataFrame(out, columns=["date", "close", "vol", "inst"])
+    df = df[df["date"].str.len() == 8]
+    return df.drop_duplicates("date").sort_values("date").reset_index(drop=True)
+
+
+def get_rows(code):
+    """최근 21거래일 (날짜, 종가, 거래량, 기관순매수량) -> DataFrame 또는 None"""
+    need = WINDOW + 1
+    urls = [f"{M_BASE}/api/stock/{code}/trend?pageSize={need}&page=1",
+            f"{S_BASE}/api/domestic/detail/{code}/trend?tradeType=KRX&startIdx=0&pageSize={need}"]
+    for url in urls:
+        data = get_json(url, retry=2)
+        lst = find_list(data) if data is not None else []
+        if not lst:
+            continue
+        if not LAST_INFO["keys"]:
+            LAST_INFO["keys"] = ", ".join(list(lst[0].keys())[:15])
+        df = rows_to_df(lst)
+        # 종가/거래량이 빠져 있으면 일별 시세에서 보충
+        if df["close"].isna().all() or df["vol"].isna().all():
+            pdata = get_json(f"{M_BASE}/api/stock/{code}/price?pageSize={need}&page=1", retry=2)
+            plst = find_list(pdata) if pdata is not None else []
+            if plst:
+                pdf = rows_to_df(plst)[["date", "close", "vol"]]
+                df = df[["date", "inst"]].merge(pdf, on="date", how="inner")
+        if len(df) >= need:
+            return df.tail(need).reset_index(drop=True)
+    return None
 
 
 # ---------------------------------------------------------------- 조건 판단
 def analyze(code, name):
     """반환: (결과dict 또는 None, 데이터상태 'ok'/'nodata', 기준일)"""
-    R = Rows(code)
-    d = R.ensure(WINDOW)
-    if d is None:
+    d21 = get_rows(code)
+    if d21 is None:
         return None, "nodata", None
-    d20 = d.tail(WINDOW).reset_index(drop=True)
+    d20 = d21.tail(WINDOW).reset_index(drop=True)
     last_date = d20["date"].iloc[-1]
+    last_date = f"{last_date[:4]}-{last_date[4:6]}-{last_date[6:]}"
 
-    # 거래량 자료 확인 (없거나 0이면 제외)
-    if d20["vol"].isna().any() or (d20["vol"] <= 0).any():
+    # 거래량/종가 자료 확인 (없거나 0이면 제외)
+    if (d21["vol"].isna().any() or (d21["vol"] <= 0).any()
+            or d21["close"].isna().any()):
         return None, "nodata", last_date
 
-    # 박스권 (종가 기준) - 통과 못하면 여기서 종료 (요청 절약)
+    # 박스권 (종가 기준)
     hi, lo = d20["close"].max(), d20["close"].min()
     if lo <= 0 or (hi - lo) / lo > BOX_MAX_RANGE:
         return None, "ok", last_date
 
-    # 조건3 계산용으로 21일째 데이터 확보
-    d21 = R.ensure(WINDOW + 1)
-    if d21 is None:
-        return None, "nodata", last_date
-    d21 = d21.tail(WINDOW + 1).reset_index(drop=True)
-    d20 = d21.tail(WINDOW).reset_index(drop=True)
     v21, v20 = d21["vol"], d20["vol"]
-
     hits = []
     ratio = v20.iloc[10:].mean() / v20.iloc[:10].mean() - 1
     if ratio >= COND2_RATIO:
@@ -227,7 +268,7 @@ def build_message(results, total, nodata, base_date):
     msg = [f"📊 수급 박스권 알림 ({now})",
            f"데이터 기준일: {base_date}",
            f"검사 {total}종목 / 해당 {len(results)}종목",
-           "출처: 네이버 금융 (종가·거래량·기관 순매매량)", ""]
+           "출처: 네이버 증권 (종가·거래량·기관 순매수량)", ""]
     for k in (2, 3, 4):
         items = [r for r in results if k in r["hits"]]
         msg.append(f"{titles[k]}  ({len(items)}개)")
@@ -238,11 +279,11 @@ def build_message(results, total, nodata, base_date):
                 f"  • {r['name']}({r['code']}) {r['close']:,}원\n"
                 f"    박스폭 {r['box']:.1f}% | 후반/전반 {r['ratio']:+.0f}% | "
                 f"증가일 {r['up_days']}일 | 급증일 {r['spikes']}회\n"
-                f"    기관 20일 순매매 {r['inst_qty']:,.0f}주 (약 {r['inst_amt']:+,.0f}억원, 추정)")
+                f"    기관 20일 순매수 {r['inst_qty']:,.0f}주 (약 {r['inst_amt']:+,.0f}억원, 추정)")
         msg.append("")
     if nodata:
         msg.append(f"⚠ 자료 미흡/수집 실패로 제외된 종목: {nodata}개")
-    msg.append("※ 거래대금은 네이버에서 제공되지 않아 거래량만 사용했습니다.")
+    msg.append("※ 거래대금은 제공되지 않아 거래량만 사용했습니다.")
     msg.append("※ 투자 판단과 책임은 본인에게 있습니다.")
     return "\n".join(msg)
 
@@ -272,6 +313,11 @@ def is_market_closed(today):
         return False
 
 
+def fail_message(prefix):
+    return (f"⚠ {prefix}\n진단: {LAST_INFO['msg'] or '원인 기록 없음'}\n"
+            f"응답 항목: {LAST_INFO['keys'] or '없음'}")
+
+
 def main():
     today = dt.datetime.now(KST).date()
     if not FORCE and is_market_closed(today):
@@ -279,8 +325,7 @@ def main():
         return
     stocks = get_universe()
     if not stocks:
-        send_telegram("⚠ 네이버 금융에서 종목 목록을 가져오지 못했습니다. (접속 차단/화면 변경 가능성)\n"
-                      "진단: " + (LAST_INFO["msg"] or "원인 기록 없음"))
+        send_telegram(fail_message("네이버 증권에서 종목 목록을 가져오지 못했습니다."))
         return
     print("검사 종목 수:", len(stocks))
 
@@ -297,13 +342,14 @@ def main():
             base_dates.append(last)
         if r:
             results.append(r)
+        if i == 30 and nodata >= 28:  # 처음부터 거의 다 실패 -> 빨리 중단하고 원인 알림
+            send_telegram(fail_message("종목별 데이터를 거의 읽지 못해 중단했습니다."))
+            return
         if i % 100 == 0:
             print(f"  진행 {i}/{len(stocks)}")
 
-    # 대부분 실패했다면 차단/구조 변경으로 판단
     if nodata > len(stocks) * 0.5:
-        send_telegram(f"⚠ 데이터 수집 실패가 많습니다 ({nodata}/{len(stocks)}). "
-                      "네이버 접속 차단 또는 화면 구조 변경 가능성이 있습니다.")
+        send_telegram(fail_message(f"데이터 수집 실패가 많습니다 ({nodata}/{len(stocks)})."))
         return
     base_date = max(base_dates) if base_dates else "알 수 없음"
     wait_until_0850()
