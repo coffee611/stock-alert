@@ -971,15 +971,21 @@ def send_top40_messages(top_rows, base_date, source_label, krx_stock=None):
 
 
 # ---------------------------------------------------------------- 실행
-def wait_until_0850():
-    """아침(9시 이전) 자동 실행이면 계산을 먼저 끝내고 08:50까지 기다렸다가 전송"""
-    now = dt.datetime.now(KST)
-    if FORCE or now.hour >= 9:
+SEND_MORNING = (7, 50)   # 오전 전송 시각 (한국시간)
+SEND_EVENING = (18, 50)  # 오후 전송 시각 (한국시간)
+
+
+def wait_until_send_time():
+    """계산을 먼저 끝내 두고, 정해진 시각(오전 07:50 / 오후 18:50)까지 기다렸다가 전송.
+    이미 그 시각이 지났으면 기다리지 않고 바로 전송. 수동 실행(FORCE)은 바로 전송."""
+    if FORCE:
         return
-    target = now.replace(hour=8, minute=50, second=0, microsecond=0)
+    now = dt.datetime.now(KST)
+    h, m = SEND_MORNING if now.hour < 12 else SEND_EVENING
+    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
     wait = (target - now).total_seconds()
-    if 0 < wait <= 40 * 60:  # 최대 40분까지만 대기
-        print(f"08:50까지 {int(wait)}초 대기")
+    if 0 < wait <= 45 * 60:  # 최대 45분까지만 대기
+        print(f"{h:02d}:{m:02d}까지 {int(wait)}초 대기")
         time.sleep(wait)
 
 
@@ -1134,7 +1140,7 @@ def main():
     except Exception as e:
         print("성과 기록 처리 오류:", e)
 
-    wait_until_0850()
+    wait_until_send_time()
     send_condition_messages(results, total, nodata, base_date, label)
     try:  # 별도 현황판: 실패해도 기존 알림에는 영향 없음
         send_top40_messages(out.get("top_rows") or {}, base_date, label, out.get("krx_stock"))
