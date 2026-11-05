@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 박스권 + 거래량 증가 종목 텔레그램 알림 (GitHub Actions용)
-데이터 출처 : 네이버 증권 (m.stock.naver.com 공개 JSON 주소, 비공식)
+데이터 출처 : 1순위 네이버 증권 (m.stock.naver.com 공개 JSON 주소, 비공식)
+              2순위(백업) 한국거래소 KRX 정보데이터시스템 (pykrx 라이브러리, KRX 회원 ID/PW 필요)
   - 종목 목록 : 시가총액 순위 (ETF/ETN/레버리지/인버스/스팩/리츠 제외)
-  - 종가/거래량/기관 순매수량 : 종목별 투자자 동향
+  - 종가/거래량/기관 순매수량
+  - DATA_SOURCE: auto(네이버 실패 시 KRX 전환) / naver / krx
 알림 : 조건 1, 2, 3 각각 별도의 텔레그램 메시지 (기관 순매수 큰 순)
 추가 정보 : 박스 안 위치 / 급증일 가격 방향 / 60일선 방향(단순+엄격)
 성과 기록 : history/alerts.csv 에 알림 종목을 저장하고 5·10·20일 뒤 수익률을 자동 계산
+별도 알림 : 「기관 5일 순매수 금액 TOP 40」 (1~20위, 21~40위 두 메시지) - 위 조건과 무관한 현황판
 """
 import os
 import re
@@ -50,6 +53,7 @@ MIN_SAMPLE = 5          # 성과 통계를 보여주기 위한 최소 표본 수
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 FORCE = os.environ.get("FORCE", "").lower() == "true"  # 수동 실행이면 휴장 체크 생략
+DATA_SOURCE = (os.environ.get("DATA_SOURCE") or "auto").strip().lower()  # auto | naver | krx
 KST = ZoneInfo("Asia/Seoul")
 M_BASE = "https://m.stock.naver.com"
 S_BASE = "https://stock.naver.com"
@@ -61,6 +65,12 @@ HEADERS = {
     "Referer": "https://m.stock.naver.com/",
 }
 LAST_INFO = {"msg": "", "keys": ""}  # 실패 원인 기록 (진단용)
+FAIL_LOG = []                        # 출처별 실패 기록 (모두 실패했을 때 알림에 사용)
+RAW_CAPS = {}                        # 네이버 응답의 시가총액 원본값 (TOP 40 시총 대비 %용)
+CAPS_EOK = {}                        # KRX 시가총액 (억원)
+
+TOP_N = 40              # 기관 순매수 TOP 몇 종목
+TOP_DAYS = 5            # 최근 몇 거래일 기준
 CODE_RE = re.compile(r"^[0-9A-Z]{6}$")
 
 # ETF/ETN/레버리지/스팩/리츠 제외용 이름 규칙
@@ -178,6 +188,9 @@ def get_universe():
                 if is_excluded(name, tp):
                     skipped += 1
                     continue
+                cap_raw = pick(d, ["marketValue", "marketCap", "marketCapitalization", "marketSum"])
+                if cap_raw is not None:
+                    RAW_CAPS[code] = to_num(cap_raw)
                 stocks.append((code, name))
     print(f"ETF/레버리지/스팩/리츠 등 제외: {skipped}개")
     return stocks
@@ -225,6 +238,8 @@ def get_rows(code):
 
 def get_history(code, need):
     """종가 이력(오래된 날짜 -> 최신) 최소 need일치. 후보 종목에만 사용. 실패 시 None"""
+    if DATA_SOURCE == "krx":
+        return get_history_krx(code, need)
     rows = []
     df = None
     for page in (1, 2, 3):
@@ -245,9 +260,161 @@ def get_history(code, need):
             df2 = df2[df2["close"].notna()]
             if df is None or len(df2) > len(df):
                 df = df2
+    if (df is None or len(df) < need) and DATA_SOURCE != "naver":
+        alt = get_history_krx(code, need)  # 네이버가 부족하면 KRX로 보충
+        if alt is not None and (df is None or len(alt) > len(df)):
+            df = alt
     if df is None or df.empty:
         return None
     return df.sort_values("date").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- KRX (한국거래소) 백업 출처
+def krx_import():
+    try:
+        from pykrx import stock
+        return stock
+    except Exception as e:
+        LAST_INFO["msg"] = f"pykrx 불러오기 실패: {type(e).__name__}: {str(e)[:120]}"
+        return None
+
+
+def krx_ohlcv(stock, d, m):
+    """하루치 시장 전체 종가/거래량 (index=종목코드)"""
+    for fn in ("get_market_ohlcv_by_ticker", "get_market_ohlcv"):
+        f = getattr(stock, fn, None)
+        if f is None:
+            continue
+        try:
+            df = f(d, market=m)
+            if df is not None and not df.empty and "종가" in df.columns:
+                return df
+        except Exception as e:
+            LAST_INFO["msg"] = f"KRX {fn} 오류 {type(e).__name__}: {str(e)[:120]}"
+    return None
+
+
+def krx_net(stock, d, m):
+    """하루치 시장 전체 기관 순매수량 (index=종목코드)"""
+    try:
+        df = stock.get_market_net_purchases_of_equities(d, d, m, "기관합계")
+    except Exception as e:
+        LAST_INFO["msg"] = f"KRX 기관 순매수 오류 {type(e).__name__}: {str(e)[:120]}"
+        return None
+    if df is None or df.empty:
+        return None
+    col = next((c for c in df.columns if "순매수" in str(c) and "거래량" in str(c)), None)
+    if col is None:
+        LAST_INFO["msg"] = f"KRX 순매수 항목을 못 찾음: {list(df.columns)[:8]}"
+        return None
+    return pd.to_numeric(df[col], errors="coerce")
+
+
+def krx_collect(stock):
+    """시장 전체를 날짜별로 받아 종목별 21거래일 DataFrame 으로 정리 -> {코드: df}"""
+    today = dt.datetime.now(KST).date()
+    start = today - dt.timedelta(days=60)
+    ref = stock.get_market_ohlcv_by_date(start.strftime("%Y%m%d"),
+                                         today.strftime("%Y%m%d"), "005930")
+    dates = [d.strftime("%Y%m%d") for d in ref.index]
+    need = WINDOW + 1
+    if len(dates) < need:
+        LAST_INFO["msg"] = LAST_INFO["msg"] or f"KRX 거래일 목록이 부족함 ({len(dates)}일)"
+        return None
+
+    markets = ("KOSPI", "KOSDAQ")
+    panels = {}  # 날짜 -> DataFrame(index=종목코드, close/vol/inst/val)
+    for d in reversed(dates):  # 최신 날짜부터
+        frames = []
+        for m in markets:
+            oh = krx_ohlcv(stock, d, m)
+            if oh is None:
+                continue
+            net = krx_net(stock, d, m)
+            f = pd.DataFrame({"close": pd.to_numeric(oh["종가"], errors="coerce"),
+                              "vol": pd.to_numeric(oh["거래량"], errors="coerce")})
+            f["val"] = (pd.to_numeric(oh["거래대금"], errors="coerce")
+                        if "거래대금" in oh.columns else float("nan"))
+            f["inst"] = net.reindex(f.index).fillna(0) if net is not None else float("nan")
+            f["mkt"] = m
+            frames.append(f)
+        panel = pd.concat(frames) if frames else None
+        valid = panel is not None and not panel.empty and panel["inst"].notna().any()
+        if not valid:
+            if panels:  # 중간 날짜가 비면 이어 붙일 수 없음
+                LAST_INFO["msg"] = LAST_INFO["msg"] or f"KRX {d} 자료가 비어 있음"
+                return None
+            continue    # 최신 날짜 수급이 아직 없으면 하루 전부터 사용
+        panels[d] = panel
+        if len(panels) >= need:
+            break
+    if len(panels) < need:
+        LAST_INFO["msg"] = LAST_INFO["msg"] or f"KRX 자료가 부족함 ({len(panels)}일)"
+        return None
+
+    ds = sorted(panels)  # 오래된 -> 최신
+    latest = ds[-1]
+    # 시가총액 상위 종목 선택
+    universe = []
+    for m in markets:
+        codes = None
+        try:
+            cap = stock.get_market_cap_by_ticker(latest, market=m)
+            if cap is not None and not cap.empty and "시가총액" in cap.columns:
+                codes = list(cap.sort_values("시가총액", ascending=False).index[:PER_MARKET_COUNT])
+                for c_, v_ in cap["시가총액"].items():
+                    CAPS_EOK[str(c_)] = float(v_) / 1e8  # 원 -> 억원
+        except Exception as e:
+            LAST_INFO["msg"] = f"KRX 시가총액 조회 오류 {type(e).__name__}: {str(e)[:100]}"
+        if codes is None:  # 시가총액을 못 받으면 거래대금 순으로 대체
+            sub = panels[latest]
+            sub = sub[sub["mkt"] == m].sort_values("val", ascending=False)
+            codes = list(sub.index[:PER_MARKET_COUNT])
+        universe += codes
+
+    close_df = pd.DataFrame({d: panels[d]["close"] for d in ds})
+    vol_df = pd.DataFrame({d: panels[d]["vol"] for d in ds})
+    inst_df = pd.DataFrame({d: panels[d]["inst"] for d in ds})
+    out = {}
+    for code in dict.fromkeys(universe):
+        if code not in close_df.index:
+            continue
+        out[code] = pd.DataFrame({"date": ds, "close": close_df.loc[code].values,
+                                  "vol": vol_df.loc[code].values,
+                                  "inst": inst_df.loc[code].values})
+    return out
+
+
+def krx_name(stock, code):
+    try:
+        n = stock.get_market_ticker_name(code)
+        return str(n) if isinstance(n, str) and n else code
+    except Exception:
+        return code
+
+
+def get_history_krx(code, need):
+    """KRX 종가 이력 (후보 종목 60일선/성과 계산용). 실패 시 None"""
+    stock = krx_import()
+    if stock is None:
+        return None
+    try:
+        today = dt.datetime.now(KST).date()
+        start = today - dt.timedelta(days=int(need * 1.6) + 15)
+        df = stock.get_market_ohlcv_by_date(start.strftime("%Y%m%d"),
+                                            today.strftime("%Y%m%d"), code)
+        if df is None or df.empty or "종가" not in df.columns:
+            return None
+        out = pd.DataFrame({"date": [d.strftime("%Y%m%d") for d in df.index],
+                            "close": pd.to_numeric(df["종가"], errors="coerce").values,
+                            "vol": pd.to_numeric(df["거래량"], errors="coerce").values
+                            if "거래량" in df.columns else float("nan"),
+                            "inst": float("nan")})
+        out = out[out["close"].notna() & (out["close"] > 0)]
+        return out.sort_values("date").reset_index(drop=True)
+    except Exception as e:
+        LAST_INFO["msg"] = f"KRX 이력 조회 오류 {type(e).__name__}: {str(e)[:100]}"
+        return None
 
 
 # ---------------------------------------------------------------- 조건 판단
@@ -260,8 +427,11 @@ def longest_streak(flags):
 
 
 def analyze(code, name):
+    return analyze_rows(code, name, get_rows(code))
+
+
+def analyze_rows(code, name, d21):
     """반환: (결과dict 또는 None, 데이터상태 'ok'/'nodata', 기준일)"""
-    d21 = get_rows(code)
     if d21 is None:
         return None, "nodata", None
     d20 = d21.tail(WINDOW).reset_index(drop=True)
@@ -629,7 +799,7 @@ def ma_line(r):
     return s + pos + "\n"
 
 
-def send_condition_messages(results, total, nodata, base_date):
+def send_condition_messages(results, total, nodata, base_date, source_label=""):
     now = dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     for k in (1, 2, 3):
         icon, title, desc = COND_INFO[k]
@@ -647,6 +817,7 @@ def send_condition_messages(results, total, nodata, base_date):
 
         header = (f"{icon} <b>{title}</b> | {esc(desc)}\n"
                   f"🕘 {now}  |  📅 기준일 {esc(base_date)}\n"
+                  f"🗂 출처: {esc(source_label)}\n"
                   f"🔎 검사 {total}종목 → <b>해당 {len(items)}종목</b>"
                   f"{tier_txt}\n"
                   f"↕ 기관 순매수 큰 순 정렬\n"
@@ -690,6 +861,115 @@ def send_condition_messages(results, total, nodata, base_date):
         send_blocks(header, blocks, "\n".join(footer))
 
 
+# ---------------------------------------------------------------- 기관 5일 순매수 TOP 40 (별도 현황판)
+def caps_in_eok():
+    """종목별 시가총액(억원). 단위를 확신할 수 없으면 빈 값 -> 시총 대비 %는 '–'로 표시"""
+    caps = dict(CAPS_EOK)
+    if not caps:
+        vals = [v for v in RAW_CAPS.values() if v == v and v > 0]
+        if not vals:
+            return {}
+        mx = max(vals)
+        div = 1e8 if mx >= 1e12 else (100 if mx >= 5e7 else 1)  # 원 / 백만원 / 억원 추정
+        caps = {c: v / div for c, v in RAW_CAPS.items() if v == v and v > 0}
+    if not caps:
+        return {}
+    mx = max(caps.values())
+    if not (1e6 <= mx <= 1e8):  # 1위 시총이 100조~1경 원이 아니면 단위 오판으로 보고 사용 안 함
+        return {}
+    return caps
+
+
+def top_metrics(d21):
+    """한 종목의 5일 기관 순매수 금액·연속 일수·등락률. 자료가 부족하면 None"""
+    d = d21.reset_index(drop=True)
+    if len(d) < TOP_DAYS + 1 or d["close"].isna().tail(TOP_DAYS + 1).any():
+        return None
+    inst5 = d["inst"].tail(TOP_DAYS)
+    if inst5.isna().any():
+        return None
+    close = d["close"]
+    amt = float((inst5 * close.tail(TOP_DAYS)).sum() / 1e8)  # 억원 (순매수 수량 x 종가, 추정)
+
+    # 기관 연속 순매수/순매도 일수 (가장 최근 날부터 같은 방향이 이어진 일수)
+    vals = [x for x in d["inst"].tolist()][::-1]
+    sign = 1 if vals[0] > 0 else (-1 if vals[0] < 0 else 0)
+    streak = 0
+    if sign != 0:
+        for x in vals:
+            if x == x and (x > 0) == (sign > 0) and x != 0:
+                streak += 1
+            else:
+                break
+    return {
+        "amt": amt, "sign": sign, "streak": streak, "all_days": len(vals),
+        "day": (close.iloc[-1] / close.iloc[-2] - 1) * 100,
+        "chg5": (close.iloc[-1] / close.iloc[-(TOP_DAYS + 1)] - 1) * 100,
+    }
+
+
+def streak_text(m):
+    if m["sign"] == 0 or m["streak"] == 0:
+        return "⚪ 보합"
+    plus = "+" if m["streak"] >= m["all_days"] else ""
+    return (f"🔴 {m['streak']}{plus}일 매수" if m["sign"] > 0
+            else f"🔵 {m['streak']}{plus}일 매도")
+
+
+def send_top40_messages(top_rows, base_date, source_label, krx_stock=None):
+    rows = []
+    for code, (name, d21) in top_rows.items():
+        m = top_metrics(d21)
+        if m is None or m["amt"] <= 0:
+            continue
+        rows.append((code, name, m))
+    if not rows:
+        print("TOP 40: 계산 가능한 종목이 없습니다.")
+        return
+    rows.sort(key=lambda x: x[2]["amt"], reverse=True)
+
+    caps = caps_in_eok()
+    picked = []
+    for code, name, m in rows:
+        if krx_stock is not None and name == code:      # KRX 경로는 상위 종목만 이름 조회
+            name = krx_name(krx_stock, code)
+        if is_excluded(name):
+            continue
+        picked.append((code, name, m))
+        if len(picked) >= TOP_N:
+            break
+
+    now = dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    for part, (a, b) in enumerate(((0, 20), (20, 40))):
+        chunk = picked[a:b]
+        if not chunk:
+            continue
+        header = (f"🏦 <b>기관 순매수 금액 TOP {TOP_N}</b> ({a + 1}~{a + len(chunk)}위)\n"
+                  f"최근 {TOP_DAYS}거래일 기관이 가장 많이 사들인 종목\n"
+                  f"🕘 {now}  |  📅 기준일 {esc(base_date)}\n"
+                  f"🗂 출처: {esc(source_label)}\n"
+                  f"━━━━━━━━━━━━━━")
+        blocks = []
+        for i, (code, name, m) in enumerate(chunk, a + 1):
+            cap = caps.get(code)
+            pct = f"{m['amt'] / cap * 100:.2f}%" if cap else "–"
+            blocks.append(
+                f"<b>{i}. {esc(name)}</b> ({esc(code)})\n"
+                f"🏦 {TOP_DAYS}일 순매수 <b>{m['amt']:+,.0f}억</b> · 시총 대비 {pct}\n"
+                f"{streak_text(m)} · 당일 {m['day']:+.1f}% · {TOP_DAYS}일 {m['chg5']:+.1f}%\n"
+                f"──────────────")
+        footer = ""
+        if part == 1 or len(picked) <= 20:
+            lines = [f"※ 금액 = 기관 일별 순매수 수량 × 종가의 {TOP_DAYS}일 합계(추정)",
+                     f"※ 시총 대비 = {TOP_DAYS}일 순매수 금액 ÷ 시가총액"
+                     + ("" if caps else " (시가총액 자료를 못 받아 '–' 표시)"),
+                     "※ 확정 데이터 기준이며 장중 추정치는 아닙니다 / 검사 대상은 시가총액 상위 종목",
+                     "※ ETF·레버리지·스팩·리츠 제외 / 위 조건 스크리너와는 별개의 현황판입니다",
+                     "※ 투자 판단과 책임은 본인에게 있습니다."]
+            footer = "\n".join(lines)
+        send_blocks(header, blocks, footer)
+
+
 # ---------------------------------------------------------------- 실행
 def wait_until_0850():
     """아침(9시 이전) 자동 실행이면 계산을 먼저 끝내고 08:50까지 기다렸다가 전송"""
@@ -716,25 +996,32 @@ def is_market_closed(today):
 
 
 def fail_message(prefix):
-    return (f"⚠ {prefix}\n진단: {LAST_INFO['msg'] or '원인 기록 없음'}\n"
-            f"응답 항목: {LAST_INFO['keys'] or '없음'}")
+    lines = [f"⚠ {prefix}"]
+    for x in FAIL_LOG:
+        lines.append("- " + x)
+    if not FAIL_LOG:
+        lines.append(f"진단: {LAST_INFO['msg'] or '원인 기록 없음'}")
+    lines.append(f"응답 항목: {LAST_INFO['keys'] or '없음'}")
+    return "\n".join(lines)
 
 
-def main():
-    now = dt.datetime.now(KST)
-    if not FORCE and is_market_closed(now.date()):
-        print("휴장일이라 건너뜁니다:", now.date())
-        return
+def scan_naver():
+    """1순위: 네이버 증권. 실패하면 None (알림은 보내지 않고 다음 출처로 넘김)"""
+    LAST_INFO["msg"] = ""
     stocks = get_universe()
     if not stocks:
-        send_plain(fail_message("네이버 증권에서 종목 목록을 가져오지 못했습니다."))
-        return
-    print("검사 종목 수:", len(stocks))
+        FAIL_LOG.append("네이버: 종목 목록 실패 / " + (LAST_INFO["msg"] or "원인 기록 없음"))
+        return None
+    print("[네이버] 검사 종목 수:", len(stocks))
 
     results, nodata, base_dates = [], 0, []
+    top_rows = {}  # TOP 40 현황판용 (코드 -> (이름, 21일 데이터))
     for i, (code, name) in enumerate(stocks, 1):
         try:
-            r, status, last = analyze(code, name)
+            d21 = get_rows(code)
+            if d21 is not None:
+                top_rows[code] = (name, d21)
+            r, status, last = analyze_rows(code, name, d21)
         except Exception as e:
             print("오류", code, e)
             r, status, last = None, "nodata", None
@@ -744,15 +1031,85 @@ def main():
             base_dates.append(last)
         if r:
             results.append(r)
-        if i == 30 and nodata >= 28:  # 처음부터 거의 다 실패 -> 빨리 중단하고 원인 알림
-            send_plain(fail_message("종목별 데이터를 거의 읽지 못해 중단했습니다."))
-            return
+        if i == 30 and nodata >= 28:  # 처음부터 거의 다 실패 -> 빨리 중단
+            FAIL_LOG.append("네이버: 종목별 데이터를 거의 읽지 못함 / " + (LAST_INFO["msg"] or "원인 기록 없음"))
+            return None
         if i % 100 == 0:
             print(f"  진행 {i}/{len(stocks)}")
-
     if nodata > len(stocks) * 0.5:
-        send_plain(fail_message(f"데이터 수집 실패가 많습니다 ({nodata}/{len(stocks)})."))
+        FAIL_LOG.append(f"네이버: 데이터 수집 실패 {nodata}/{len(stocks)} / " + (LAST_INFO["msg"] or ""))
+        return None
+    return {"results": results, "total": len(stocks), "nodata": nodata, "base_dates": base_dates,
+            "top_rows": top_rows, "krx_stock": None}
+
+
+def scan_krx():
+    """2순위(또는 지정 시): 한국거래소 KRX (pykrx). 실패하면 None"""
+    LAST_INFO["msg"] = ""
+    stock = krx_import()
+    if stock is None:
+        FAIL_LOG.append("KRX: " + LAST_INFO["msg"])
+        return None
+    try:
+        data = krx_collect(stock)
+    except Exception as e:
+        FAIL_LOG.append(f"KRX: 수집 오류 {type(e).__name__}: {str(e)[:150]}"
+                        + (f" / {LAST_INFO['msg']}" if LAST_INFO["msg"] else ""))
+        return None
+    if not data:
+        FAIL_LOG.append("KRX: " + (LAST_INFO["msg"] or "자료 없음 (KRX 로그인/접속 확인 필요)"))
+        return None
+    print("[KRX] 검사 종목 수:", len(data))
+
+    results, nodata, base_dates = [], 0, []
+    top_rows = {code: (code, d21) for code, d21 in data.items()}  # TOP 40 현황판용
+    for code, d21 in data.items():
+        try:
+            r, status, last = analyze_rows(code, code, d21)
+        except Exception as e:
+            print("오류", code, e)
+            r, status, last = None, "nodata", None
+        if status == "nodata":
+            nodata += 1
+        if last:
+            base_dates.append(last)
+        if r:
+            results.append(r)
+    # 종목명 확인 + ETF/스팩/리츠 등 제외 (후보 종목에만 조회)
+    final = []
+    for r in results:
+        name = krx_name(stock, r["code"])
+        if is_excluded(name):
+            continue
+        r["name"] = name
+        final.append(r)
+    if nodata > len(data) * 0.5:
+        FAIL_LOG.append(f"KRX: 데이터 수집 실패 {nodata}/{len(data)}")
+        return None
+    return {"results": final, "total": len(data), "nodata": nodata, "base_dates": base_dates,
+            "top_rows": top_rows, "krx_stock": stock}
+
+
+def main():
+    now = dt.datetime.now(KST)
+    if not FORCE and is_market_closed(now.date()):
+        print("휴장일이라 건너뜁니다:", now.date())
         return
+
+    out, label = None, ""
+    if DATA_SOURCE in ("auto", "naver"):
+        out, label = scan_naver(), "네이버 증권"
+    if out is None and DATA_SOURCE in ("auto", "krx"):
+        if DATA_SOURCE == "auto":
+            print("네이버 수집 실패 -> KRX(한국거래소)로 전환합니다.")
+        out = scan_krx()
+        label = "한국거래소(KRX) 정보데이터시스템" + (" ※네이버 실패로 전환" if DATA_SOURCE == "auto" else "")
+    if out is None:
+        send_plain(fail_message("모든 데이터 출처에서 수집에 실패했습니다."))
+        return
+
+    results, total, nodata = out["results"], out["total"], out["nodata"]
+    base_dates = out["base_dates"]
     base_date = max(base_dates) if base_dates else "알 수 없음"
 
     # 후보 종목에만 60일선 분석 (요청 수를 아끼기 위해)
@@ -778,7 +1135,11 @@ def main():
         print("성과 기록 처리 오류:", e)
 
     wait_until_0850()
-    send_condition_messages(results, len(stocks), nodata, base_date)
+    send_condition_messages(results, total, nodata, base_date, label)
+    try:  # 별도 현황판: 실패해도 기존 알림에는 영향 없음
+        send_top40_messages(out.get("top_rows") or {}, base_date, label, out.get("krx_stock"))
+    except Exception as e:
+        print("TOP 40 처리 오류:", type(e).__name__, e)
     if perf_msg and (FORCE or now.hour >= 12):  # 성과 요약은 저녁 알림에만
         tg_send(perf_msg, use_html=True)
     print("완료. 해당 종목:", len(results))
