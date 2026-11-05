@@ -3,9 +3,19 @@ name: stock-alert
 on:
   schedule:
     # GitHub 시간은 UTC(한국시간 -9시간)
-    - cron: "20 23 * * 0-4"   # 한국시간 월~금 07:30 시작 -> 계산 후 08:00에 전송
-    - cron: "0 10 * * 1-5"    # 한국시간 월~금 18:20
+    - cron: "20 22 * * 0-4"   # 한국시간 월~금 07:20 시작 -> 계산 후 07:50에 전송
+    - cron: "20 9 * * 1-5"    # 한국시간 월~금 18:20 시작 -> 계산 후 18:50에 전송
   workflow_dispatch:           # 수동 실행 버튼 (테스트용)
+    inputs:
+      source:
+        description: "데이터 출처 (auto=네이버 실패 시 KRX 전환 / naver / krx)"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - naver
+          - krx
 
 # 성과 기록 파일(history/alerts.csv)을 저장소에 자동 저장하기 위한 권한
 permissions:
@@ -28,13 +38,16 @@ jobs:
           python-version: "3.12"
 
       - name: Install packages
-        run: pip install requests pandas holidays
+        run: pip install requests pandas holidays pykrx
 
       - name: Run alert
         run: python stock_alert.py
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          KRX_ID: ${{ secrets.KRX_ID }}
+          KRX_PW: ${{ secrets.KRX_PW }}
+          DATA_SOURCE: ${{ github.event.inputs.source || 'auto' }}
           FORCE: ${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Save history
