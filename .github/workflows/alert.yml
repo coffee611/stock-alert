@@ -37,8 +37,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Korean font (TOP 40 표 이미지용)
+        run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq fonts-nanum || true
+
       - name: Install packages
-        run: pip install requests pandas holidays pykrx
+        run: pip install requests pandas holidays pykrx pillow
 
       - name: Run alert
         run: python stock_alert.py
@@ -53,9 +58,9 @@ jobs:
       - name: Save history
         if: always()
         run: |
-          if [ -f history/alerts.csv ]; then
+          if [ -d history ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add history/alerts.csv
+            git add history/*.csv
             git diff --cached --quiet || (git commit -m "update alert history" && git push)
           fi
