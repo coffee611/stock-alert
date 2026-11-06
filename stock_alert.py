@@ -6,10 +6,11 @@
   - 종목 목록 : 시가총액 순위 (ETF/ETN/레버리지/인버스/스팩/리츠 제외)
   - 종가/거래량/기관 순매수량
   - DATA_SOURCE: auto(네이버 실패 시 KRX 전환) / naver / krx
-알림 : 조건 1, 2, 3 각각 별도의 텔레그램 메시지 (기관 순매수 큰 순)
+알림 : 조건 1, 2, 3 각각 별도의 텔레그램 표 이미지 (기관 순매수 큰 순, 실패 시 글자 메시지로 대체)
 추가 정보 : 박스 안 위치 / 급증일 가격 방향 / 60일선 방향(단순+엄격)
 성과 기록 : history/alerts.csv 에 알림 종목을 저장하고 5·10·20일 뒤 수익률을 자동 계산
-별도 알림 : 「기관 5일 순매수 금액 TOP 40」 (1~20위, 21~40위 두 메시지) - 위 조건과 무관한 현황판
+자료 신선도 : 매 실행마다 기준일/지연 여부를 history/freshness.csv 에 기록하고, 하루 이상 늦으면 알림에 경고 표시
+별도 알림 : 「기관 5일 순매수 금액 TOP 40」 (1~20위, 21~40위 표 이미지 2장) - 위 조건과 무관한 현황판
 """
 import os
 import re
@@ -66,11 +67,15 @@ HEADERS = {
 }
 LAST_INFO = {"msg": "", "keys": ""}  # 실패 원인 기록 (진단용)
 FAIL_LOG = []                        # 출처별 실패 기록 (모두 실패했을 때 알림에 사용)
+FRESH = {}                           # 이번 실행의 자료 신선도 (예상 기준일 / 실제 기준일 / 지연 일수)
+FRESH_PATH = "history/freshness.csv"
 RAW_CAPS = {}                        # 네이버 응답의 시가총액 원본값 (TOP 40 시총 대비 %용)
 CAPS_EOK = {}                        # KRX 시가총액 (억원)
 
 TOP_N = 40              # 기관 순매수 TOP 몇 종목
 TOP_DAYS = 5            # 최근 몇 거래일 기준
+TOP_FORMAT = "image"    # TOP 40 표시 방식: image(표 이미지) / text(글자) / both  (이미지가 실패하면 자동으로 글자로 대체)
+COND_FORMAT = "image"   # 조건 1·2·3 표시 방식: image(표 이미지) / text(글자) / both  (이미지가 실패하면 자동으로 글자로 대체)
 CODE_RE = re.compile(r"^[0-9A-Z]{6}$")
 
 # ETF/ETN/레버리지/스팩/리츠 제외용 이름 규칙
@@ -818,6 +823,7 @@ def send_condition_messages(results, total, nodata, base_date, source_label=""):
         header = (f"{icon} <b>{title}</b> | {esc(desc)}\n"
                   f"🕘 {now}  |  📅 기준일 {esc(base_date)}\n"
                   f"🗂 출처: {esc(source_label)}\n"
+                  f"{fresh_line()}"
                   f"🔎 검사 {total}종목 → <b>해당 {len(items)}종목</b>"
                   f"{tier_txt}\n"
                   f"↕ 기관 순매수 큰 순 정렬\n"
@@ -858,7 +864,402 @@ def send_condition_messages(results, total, nodata, base_date, source_label=""):
                 footer.append(f"⚠ 자료 미흡/수집 실패 제외: {nodata}개")
             footer.append("※ ETF·레버리지·스팩·리츠 제외 / 거래대금 미제공(거래량 기준)\n"
                           "※ 투자 판단과 책임은 본인에게 있습니다.")
+        if COND_FORMAT in ("image", "both") and shown:
+            caption_head = header.replace("\n━━━━━━━━━━━━━━", "")
+            if send_condition_images(k, shown, len(items), total, nodata, base_date,
+                                     source_label, caption_head):
+                if COND_FORMAT == "image":
+                    continue
+            else:
+                print(f"조건{k} 표 이미지를 만들거나 보내지 못해 글자 메시지로 대체합니다.")
         send_blocks(header, blocks, "\n".join(footer))
+
+
+# ---------------------------------------------------------------- 조건 1·2·3 표 이미지
+def wrap_px(draw, text, font, max_w):
+    """픽셀 너비 기준 줄바꿈"""
+    lines, cur = [], ""
+    for ch in text:
+        if draw.textlength(cur + ch, font=font) > max_w and cur:
+            lines.append(cur)
+            cur = ch
+        else:
+            cur += ch
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def draw_star(d, cx, cy, r, fill):
+    import math
+    pts = []
+    for i in range(10):
+        ang = -math.pi / 2 + i * math.pi / 5
+        rad = r if i % 2 == 0 else r * 0.45
+        pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+    d.polygon(pts, fill=fill)
+
+
+def render_condition_image(k, chunk, start_rank, n_items, n_hidden, total, nodata, base_date, source_label):
+    """조건 k 의 종목 표(PNG 바이트). 글꼴/Pillow 가 없으면 None"""
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as e:
+        print("Pillow 불러오기 실패:", e)
+        return None
+    f_title, f_sub = load_font(30, True), load_font(19)
+    f_head, f_body, f_bold = load_font(16), load_font(20), load_font(20, True)
+    f_small, f_tag = load_font(15), load_font(14, True)
+    if not all([f_title, f_sub, f_head, f_body, f_bold, f_small, f_tag]):
+        print("한글 글꼴을 찾지 못했습니다.")
+        return None
+
+    RED, BLUE, INK, GRAY = (217, 58, 58), (47, 111, 214), (29, 29, 31), (138, 143, 152)
+    ORANGE, GOLD = (245, 140, 30), (232, 176, 20)
+    LINE, HEAD_BG, PINK, YEL = (232, 234, 238), (246, 247, 249), (253, 238, 238), (255, 249, 226)
+    W, ROW, TOP_H, HEAD_H = 1240, 46, 136, 70
+    notes = [
+        "박스 위치: 0%=박스 하단, 100%=박스 상단 (20일 종가 기준) / 급증일 방향: ▲ 급증일 종가가 전일보다 상승, ▼ 하락 / "
+        f"60일선: 20일 변화율 ±{MA_FLAT_PCT:g}% 기준, 엄격=20일 중 {MA_STRICT_DAYS}일 이상 같은 방향 / 종가 vs 60일선: 종가가 60일선보다 몇 % 위(+)·아래(-)인지",
+        "기관 20일 = 일별 기관 순매수 수량 × 종가의 20일 합계(추정, 억원) / ETF·레버리지·스팩·리츠 제외 / 거래대금 미제공(거래량 기준)",
+        "규칙으로 계산한 신호이며 매수 추천이 아닙니다. 투자 판단과 책임은 본인에게 있습니다."]
+    extra = []
+    if n_hidden > 0:
+        extra.append(f"외 {n_hidden}종목은 표시하지 않았습니다 (상위 {MAX_PER_CONDITION}개까지 표시)")
+    if nodata:
+        extra.append(f"자료 미흡/수집 실패로 제외된 종목 {nodata}개")
+    tmp = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    foot_lines = []
+    for t in notes + extra:
+        foot_lines += wrap_px(tmp, t, f_small, W - 48)
+    H = TOP_H + HEAD_H + ROW * len(chunk) + 52 + 24 * len(foot_lines) + 16
+    img = Image.new("RGB", (W, H), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+
+    def tw(txt, font):
+        return d.textlength(txt, font=font)
+
+    def put(x, y, txt, font, color, align="left"):
+        w = tw(txt, font)
+        x0 = x if align == "left" else (x - w if align == "right" else x - w / 2)
+        d.text((x0, y), txt, font=font, fill=color, anchor="lm")
+
+    icon, title, desc = COND_INFO[k]
+    # 제목
+    d.rounded_rectangle((24, 22, 62, 60), radius=8, fill=(228, 236, 255))
+    put(43, 41, str(k), f_bold, BLUE, "center")
+    put(76, 41, f"조건{k}", f_title, INK)
+    put(76 + tw(f"조건{k}", f_title) + 14, 45, desc, f_sub, GRAY)
+    meta = (f"기준일 {base_date}  ·  출처 {source_label}  ·  검사 {total}종목 → 해당 {n_items}종목  ·  기관 순매수 큰 순")
+    put(24, 84, meta, f_small, GRAY)
+    if FRESH and FRESH.get("lag", 0) > 0:
+        put(24, 110, f"※ 최신 수급 미반영: 예상 기준일 {FRESH['expected']}, 실제 {FRESH['base']} ({FRESH['lag']}거래일 전 자료)", f_small, RED)
+    elif FRESH:
+        put(24, 110, "최신 자료 (예상 기준일과 일치)", f_small, GRAY)
+
+    # 열 위치
+    C_RANK, X_NAME, C_SIG = 34, 62, 266
+    R_PRICE, R_INST = 372, 484
+    R_METRIC, R_BOXW, R_BOXP = 626, 724, 836
+    C_SPIKE, C_MA, R_GAP = 936, 1076, 1218
+    metric_head = {1: ("거래량 증가율", "(후반 vs 전반)"), 2: ("거래량 연속", "증가 일수"),
+                   3: ("급증일 수", f"(평균 {COND3_MULT:g}배↑)")}[k]
+    y0 = TOP_H
+    d.rectangle((0, y0, W, y0 + HEAD_H), fill=HEAD_BG)
+    d.rectangle((384, y0, R_INST + 22, y0 + HEAD_H), fill=PINK)
+    hy = y0 + HEAD_H // 2
+
+    def head2(x, a, b, align, color=GRAY):
+        put(x, hy - 12, a, f_head, color, align)
+        put(x, hy + 12, b, f_head, color, align)
+
+    put(C_RANK, hy, "#", f_head, GRAY, "center")
+    put(X_NAME, hy, "종목명", f_head, GRAY)
+    put(C_SIG, hy, "신호", f_head, GRAY, "center")
+    head2(R_PRICE, "현재가", "(원)", "right")
+    head2(R_INST, "기관 20일", "(억)", "right", RED)
+    head2(R_METRIC, metric_head[0], metric_head[1], "right")
+    head2(R_BOXW, "박스폭", "(20일 종가)", "right")
+    head2(R_BOXP, "박스 위치", "(0%=하단)", "right")
+    head2(C_SPIKE, "급증일 방향", "(▲오름 ▼내림)", "center")
+    head2(C_MA, "60일선", "(20일 변화·엄격)", "center")
+    head2(R_GAP, "종가 vs", "60일선", "right")
+
+    for i, r in enumerate(chunk):
+        top = y0 + HEAD_H + i * ROW
+        cy = top + ROW // 2
+        if r.get("pullback"):
+            d.rectangle((0, top, W, top + ROW), fill=YEL)
+        d.rectangle((384, top, R_INST + 22, top + ROW), fill=PINK)
+        d.line((0, top + ROW, W, top + ROW), fill=LINE, width=1)
+
+        put(C_RANK, cy, str(start_rank + i), f_body, GRAY, "center")
+        nm = r["name"]
+        while tw(nm, f_bold) > 188 and len(nm) > 2:
+            nm = nm[:-1]
+        if nm != r["name"]:
+            nm = nm[:-1] + "…"
+        put(X_NAME, cy, nm, f_bold, INK)
+
+        # 신호: 조건 충족 개수(빨강=3개, 주황=2개) + 눌림목(별)
+        marks = []
+        if len(r["hits"]) >= 3:
+            marks.append(("dot", RED))
+        elif len(r["hits"]) == 2:
+            marks.append(("dot", ORANGE))
+        if r.get("pullback"):
+            marks.append(("star", GOLD))
+        for j, (kind, col) in enumerate(marks):
+            cx = C_SIG + (j - (len(marks) - 1) / 2) * 30
+            if kind == "dot":
+                d.ellipse((cx - 8, cy - 8, cx + 8, cy + 8), fill=col)
+            else:
+                draw_star(d, cx, cy, 11, col)
+        if not marks:
+            put(C_SIG, cy, "·", f_body, LINE, "center")
+
+        put(R_PRICE, cy, f"{r['close']:,}", f_body, INK, "right")
+        put(R_INST, cy, f"{r['inst_amt']:+,.0f}", f_bold, INK, "right")
+        if k == 1:
+            put(R_METRIC, cy, f"{r['ratio']:+.0f}%", f_bold, RED if r["ratio"] > 0 else INK, "right")
+        elif k == 2:
+            put(R_METRIC, cy, f"{r['streak']}일", f_bold, INK, "right")
+        else:
+            put(R_METRIC, cy, f"{r['spikes']}회", f_bold, INK, "right")
+        put(R_BOXW, cy, f"{r['box']:.1f}%", f_body, INK, "right")
+        put(R_BOXP, cy, f"{r['box_pos']:.0f}% {box_label(r['box_pos'])}", f_body, INK, "right")
+
+        if r["spikes"] >= 1:
+            col = RED if r["spike_dir"] == "매수세 우위" else (BLUE if r["spike_dir"] == "매도세 우위" else INK)
+            put(C_SPIKE, cy, f"▲{r['spike_up']} ▼{r['spike_dn']}", f_body, col, "center")
+        else:
+            put(C_SPIKE, cy, "–", f_body, GRAY, "center")
+
+        lab = r.get("ma_label")
+        if lab in ("상승", "횡보", "하락"):
+            col = RED if lab == "상승" else (BLUE if lab == "하락" else GRAY)
+            main = f"{lab} {r['ma_chg']:+.1f}%"
+            tag = {"up": "엄격", "down": "엄격"}.get(r.get("ma_strict"), "")
+            total_w = tw(main, f_body) + ((tw(tag, f_tag) + 18) if tag else 0)
+            x = C_MA - total_w / 2
+            put(x, cy, main, f_body, col)
+            if tag:
+                tx = x + tw(main, f_body) + 8
+                d.rounded_rectangle((tx, cy - 11, tx + tw(tag, f_tag) + 10, cy + 11), radius=5, outline=col, width=2)
+                put(tx + 5, cy, tag, f_tag, col)
+        else:
+            put(C_MA, cy, "자료 부족", f_body, GRAY, "center")
+
+        gap = r.get("ma_gap")
+        if gap is None:
+            put(R_GAP, cy, "–", f_body, GRAY, "right")
+        else:
+            near = abs(gap) <= PULLBACK_MA_GAP
+            put(R_GAP, cy, f"{gap:+.1f}%", f_bold if near else f_body,
+                RED if gap > 0 else (BLUE if gap < 0 else INK), "right")
+
+    # 범례 + 안내
+    ly = y0 + HEAD_H + ROW * len(chunk) + 26
+    x = 24
+    d.ellipse((x, ly - 8, x + 16, ly + 8), fill=RED)
+    put(x + 22, ly, "조건 3개 모두 충족", f_small, INK)
+    x += 22 + tw("조건 3개 모두 충족", f_small) + 22
+    d.ellipse((x, ly - 8, x + 16, ly + 8), fill=ORANGE)
+    put(x + 22, ly, "조건 2개 충족", f_small, INK)
+    x += 22 + tw("조건 2개 충족", f_small) + 22
+    draw_star(d, x + 8, ly, 10, GOLD)
+    lg = (f"눌림목 패턴 (노란 줄): 박스 하단({PULLBACK_BOX_MAX}%↓) · 급증일 ▲{PULLBACK_SPIKE_UP_MIN}일↑ · "
+          f"60일선 엄격 상승 · 종가 60일선 ±{PULLBACK_MA_GAP:g}% 이내")
+    put(x + 24, ly, lg, f_small, INK)
+    fy = ly + 28
+    for j, line in enumerate(foot_lines):
+        put(24, fy + 24 * j, line, f_small, GRAY)
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def send_condition_images(k, shown, n_items, total, nodata, base_date, source_label, caption_head):
+    """조건 k 표 이미지 전송 (20종목씩 나눔). 하나라도 실패하면 False"""
+    parts = [shown[i:i + 20] for i in range(0, len(shown), 20)]
+    for pi, chunk in enumerate(parts):
+        png = render_condition_image(k, chunk, pi * 20 + 1, n_items, max(0, n_items - len(shown)),
+                                     total, nodata, base_date, source_label)
+        if png is None:
+            return False
+        caption = caption_head + (f"\n({pi + 1}/{len(parts)})" if len(parts) > 1 else "")
+        if not tg_send_photo(png, caption[:1000]):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------- TOP 40 표 이미지
+FONT_REG = ["/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+            "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "C:/Windows/Fonts/malgun.ttf", "/System/Library/Fonts/AppleSDGothicNeo.ttc"]
+FONT_BOLD = ["/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+             "/usr/share/fonts/truetype/nanum/NanumBarunGothicBold.ttf",
+             "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+             "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+             "C:/Windows/Fonts/malgunbd.ttf", "/System/Library/Fonts/AppleSDGothicNeo.ttc"]
+
+
+def load_font(size, bold=False):
+    from PIL import ImageFont
+    for path in (FONT_BOLD if bold else FONT_REG):
+        if not os.path.exists(path):
+            continue
+        for idx in ((1, 0, 2) if path.endswith(".ttc") else (0,)):  # .ttc 는 한국어(KR) 서체 우선
+            try:
+                return ImageFont.truetype(path, size, index=idx)
+            except Exception:
+                continue
+    return None
+
+
+def render_top40_image(chunk, start_rank, caps, base_date, source_label):
+    """표 이미지(PNG 바이트) 생성. 글꼴/Pillow 가 없으면 None"""
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as e:
+        print("Pillow 불러오기 실패:", e)
+        return None
+    f_title, f_sub = load_font(30, True), load_font(19)
+    f_head, f_body, f_bold = load_font(17), load_font(21), load_font(21, True)
+    f_small = load_font(16)
+    if not all([f_title, f_sub, f_head, f_body, f_bold, f_small]):
+        print("한글 글꼴을 찾지 못했습니다.")
+        return None
+
+    RED, BLUE, INK, GRAY = (217, 58, 58), (47, 111, 214), (29, 29, 31), (138, 143, 152)
+    LINE, HEAD_BG, PINK = (232, 234, 238), (246, 247, 249), (253, 238, 238)
+    W, ROW, TOP_H, HEAD_H = 1000, 46, 136, 70
+    foot = [f"금액 = 기관 일별 순매수 수량 × 종가의 {TOP_DAYS}일 합계(추정) / 시총 대비 = {TOP_DAYS}일 순매수 금액 ÷ 시가총액"
+            + ("" if caps else " (시총 자료 없음 → –)"),
+            "확정 데이터 기준(장중 추정 아님) / ETF·레버리지·스팩·리츠 제외 / 투자 판단과 책임은 본인에게 있습니다"]
+    H = TOP_H + HEAD_H + ROW * len(chunk) + 20 + 26 * len(foot) + 14
+    img = Image.new("RGB", (W, H), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+
+    def tw(txt, font):
+        return d.textlength(txt, font=font)
+
+    def put(x, y, txt, font, color, align="left"):
+        w = tw(txt, font)
+        x0 = x if align == "left" else (x - w if align == "right" else x - w / 2)
+        d.text((x0, y), txt, font=font, fill=color, anchor="lm")
+
+    # 제목
+    d.rounded_rectangle((24, 22, 62, 60), radius=8, fill=(228, 236, 255))
+    put(43, 41, "M", f_bold, BLUE, "center")
+    put(76, 41, f"기관 순매수 금액 TOP {TOP_N}", f_title, INK)
+    rng = f"{start_rank}~{start_rank + len(chunk) - 1}위"
+    put(76 + tw(f"기관 순매수 금액 TOP {TOP_N}", f_title) + 12, 45, f"{rng} · 최근 {TOP_DAYS}거래일 기관이 가장 많이 사들인 종목", f_sub, GRAY)
+    meta = f"기준일 {base_date}  ·  출처 {source_label}"
+    put(24, 84, meta, f_small, GRAY)
+    if FRESH and FRESH.get("lag", 0) > 0:
+        put(24, 110, f"※ 최신 수급 미반영: 예상 기준일 {FRESH['expected']}, 실제 {FRESH['base']} ({FRESH['lag']}거래일 전 자료)", f_small, RED)
+    elif FRESH:
+        put(24, 110, "최신 자료 (예상 기준일과 일치)", f_small, GRAY)
+
+    # 열 위치
+    X_RANK, X_NAME = 40, 78
+    R_AMT, R_PCT, C_STREAK, R_DAY, R_CHG = 432, 590, 716, 846, 966
+    y0 = TOP_H
+    d.rectangle((0, y0, W, y0 + HEAD_H), fill=HEAD_BG)
+    d.rectangle((258, y0, R_AMT + 22, y0 + HEAD_H), fill=PINK)
+    hy = y0 + HEAD_H // 2
+    put(X_RANK, hy, "#", f_head, GRAY, "center")
+    put(X_NAME, hy, "종목명", f_head, GRAY)
+    put(R_AMT, hy - 12, f"기관 {TOP_DAYS}일", f_head, RED, "right")
+    put(R_AMT, hy + 12, "(억)", f_head, RED, "right")
+    put(R_PCT, hy - 12, "시총 대비", f_head, GRAY, "right")
+    put(R_PCT, hy + 12, "기관 순매수 %", f_head, GRAY, "right")
+    put(C_STREAK, hy - 12, "기관 연속", f_head, GRAY, "center")
+    put(C_STREAK, hy + 12, "순매수", f_head, GRAY, "center")
+    put(R_DAY, hy, "등락률", f_head, GRAY, "right")
+    put(R_CHG, hy, f"{TOP_DAYS}거래일", f_head, GRAY, "right")
+
+    def chg_color(v):
+        return RED if v > 0 else (BLUE if v < 0 else INK)
+
+    for i, (code, name, m) in enumerate(chunk):
+        top = y0 + HEAD_H + i * ROW
+        cy = top + ROW // 2
+        d.rectangle((258, top, R_AMT + 22, top + ROW), fill=PINK)
+        d.line((0, top + ROW, W, top + ROW), fill=LINE, width=1)
+        nm = name
+        while tw(nm, f_bold) > 190 and len(nm) > 2:
+            nm = nm[:-1]
+        if nm != name:
+            nm = nm[:-1] + "…"
+        put(X_RANK, cy, str(start_rank + i), f_body, GRAY, "center")
+        put(X_NAME, cy, nm, f_bold, INK)
+        put(R_AMT, cy, f"{m['amt']:+,.0f}", f_bold, INK, "right")
+        cap = caps.get(code)
+        if cap:
+            pct = m["amt"] / cap * 100
+            put(R_PCT, cy, f"{pct:.2f}%", f_bold if pct >= 1.0 else f_body, RED if pct >= 1.0 else INK, "right")
+        else:
+            put(R_PCT, cy, "–", f_body, GRAY, "right")
+        plus = "+" if m["streak"] >= m["all_days"] else ""
+        if m["sign"] > 0 and m["streak"]:
+            put(C_STREAK, cy, f"{m['streak']}{plus}일 매수", f_body, RED, "center")
+        elif m["sign"] < 0 and m["streak"]:
+            put(C_STREAK, cy, f"{m['streak']}{plus}일 매도", f_body, BLUE, "center")
+        else:
+            put(C_STREAK, cy, "보합", f_body, GRAY, "center")
+        put(R_DAY, cy, f"{m['day']:+.1f}%", f_body, chg_color(m["day"]), "right")
+        put(R_CHG, cy, f"{m['chg5']:+.1f}%", f_body, chg_color(m["chg5"]), "right")
+
+    fy = y0 + HEAD_H + ROW * len(chunk) + 24
+    for k, line in enumerate(foot):
+        put(24, fy + 26 * k, line, f_small, GRAY)
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def tg_send_photo(png, caption):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("[오류] 텔레그램 토큰/채팅ID(Secrets)가 설정되지 않았습니다. (이미지 %d바이트)" % len(png))
+        return False
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+                          data={"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+                          files={"photo": ("top40.png", png, "image/png")}, timeout=30)
+        ok = r.status_code == 200
+        print("텔레그램 사진 전송", "성공" if ok else f"실패: {r.status_code} {r.text[:150]}")
+    except Exception as e:
+        print("텔레그램 사진 전송 실패:", e)
+        ok = False
+    time.sleep(1)
+    return ok
+
+
+def send_top40_images(picked, caps, base_date, source_label):
+    """표 이미지 2장(1~20위, 21~40위) 전송. 하나라도 만들지 못하면 False"""
+    now = dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    sent = 0
+    for a, b in ((0, 20), (20, 40)):
+        chunk = picked[a:b]
+        if not chunk:
+            continue
+        png = render_top40_image(chunk, a + 1, caps, base_date, source_label)
+        if png is None:
+            return False
+        caption = (f"🏦 <b>기관 순매수 금액 TOP {TOP_N}</b> ({a + 1}~{a + len(chunk)}위)\n"
+                   f"🕘 {now}  |  📅 기준일 {esc(base_date)}\n"
+                   f"🗂 출처: {esc(source_label)}\n"
+                   f"{fresh_line()}")
+        if not tg_send_photo(png, caption):
+            return False
+        sent += 1
+    return sent > 0
 
 
 # ---------------------------------------------------------------- 기관 5일 순매수 TOP 40 (별도 현황판)
@@ -939,6 +1340,13 @@ def send_top40_messages(top_rows, base_date, source_label, krx_stock=None):
         if len(picked) >= TOP_N:
             break
 
+    if TOP_FORMAT in ("image", "both"):
+        if send_top40_images(picked, caps, base_date, source_label):
+            if TOP_FORMAT == "image":
+                return
+        else:
+            print("TOP 40 표 이미지를 만들거나 보내지 못해 글자 메시지로 대체합니다.")
+
     now = dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     for part, (a, b) in enumerate(((0, 20), (20, 40))):
         chunk = picked[a:b]
@@ -948,6 +1356,7 @@ def send_top40_messages(top_rows, base_date, source_label, krx_stock=None):
                   f"최근 {TOP_DAYS}거래일 기관이 가장 많이 사들인 종목\n"
                   f"🕘 {now}  |  📅 기준일 {esc(base_date)}\n"
                   f"🗂 출처: {esc(source_label)}\n"
+                  f"{fresh_line()}"
                   f"━━━━━━━━━━━━━━")
         blocks = []
         for i, (code, name, m) in enumerate(chunk, a + 1):
@@ -968,6 +1377,76 @@ def send_top40_messages(top_rows, base_date, source_label, krx_stock=None):
                      "※ 투자 판단과 책임은 본인에게 있습니다."]
             footer = "\n".join(lines)
         send_blocks(header, blocks, footer)
+
+
+# ---------------------------------------------------------------- 자료 신선도 (기준일 지연 점검)
+def prev_trading_day(d):
+    """d 보다 이전의 가장 가까운 거래일"""
+    d = d - dt.timedelta(days=1)
+    while is_market_closed(d):
+        d -= dt.timedelta(days=1)
+    return d
+
+
+def expected_base_date(now):
+    """지금 시각에 '있어야 정상'인 기준일: 거래일 16시 이후면 오늘, 그 외에는 직전 거래일"""
+    today = now.date()
+    if not is_market_closed(today) and now.hour >= 16:
+        return today
+    return prev_trading_day(today)
+
+
+def trading_lag(base, expected):
+    """base 가 expected 보다 몇 거래일 늦은지 (같거나 최신이면 0)"""
+    n, d = 0, base
+    while d < expected:
+        d += dt.timedelta(days=1)
+        if not is_market_closed(d):
+            n += 1
+    return n
+
+
+def compute_fresh(now, base_date):
+    try:
+        base = dt.date.fromisoformat(str(base_date))
+    except Exception:
+        return {}
+    exp = expected_base_date(now)
+    return {"expected": exp.isoformat(), "base": base.isoformat(), "lag": trading_lag(base, exp)}
+
+
+def fresh_line():
+    if not FRESH:
+        return ""
+    if FRESH["lag"] > 0:
+        return (f"⚠ <b>최신 수급 미반영</b>: 예상 기준일 {FRESH['expected']}, "
+                f"실제 {FRESH['base']} ({FRESH['lag']}거래일 전 자료)\n")
+    return "✅ 최신 자료 (예상 기준일과 일치)\n"
+
+
+FRESH_COLS = ["run_at", "source", "expected_base", "actual_base", "lag_days",
+              "stocks_at_base_pct", "total", "nodata", "candidates", "calc_min", "status"]
+
+
+def record_freshness(now, source, base_dates, total, nodata, candidates, status, t0):
+    """실행마다 한 줄 기록 -> 몇 주 쌓이면 어느 시각에 최신 자료가 나오는지 확인 가능"""
+    try:
+        os.makedirs(os.path.dirname(FRESH_PATH) or ".", exist_ok=True)
+        top = max(base_dates) if base_dates else ""
+        pct = round(base_dates.count(top) / len(base_dates) * 100, 1) if base_dates else ""
+        row = {
+            "run_at": now.strftime("%Y-%m-%d %H:%M"), "source": source,
+            "expected_base": FRESH.get("expected", expected_base_date(now).isoformat()),
+            "actual_base": top, "lag_days": FRESH.get("lag", ""),
+            "stocks_at_base_pct": pct, "total": total, "nodata": nodata,
+            "candidates": candidates, "calc_min": round((time.time() - t0) / 60, 1),
+            "status": status,
+        }
+        new_file = not os.path.exists(FRESH_PATH)
+        pd.DataFrame([row], columns=FRESH_COLS).to_csv(
+            FRESH_PATH, mode="a", header=new_file, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        print("신선도 기록 오류:", type(e).__name__, e)
 
 
 # ---------------------------------------------------------------- 실행
@@ -1097,6 +1576,7 @@ def scan_krx():
 
 
 def main():
+    t0 = time.time()
     now = dt.datetime.now(KST)
     if not FORCE and is_market_closed(now.date()):
         print("휴장일이라 건너뜁니다:", now.date())
@@ -1111,12 +1591,17 @@ def main():
         out = scan_krx()
         label = "한국거래소(KRX) 정보데이터시스템" + (" ※네이버 실패로 전환" if DATA_SOURCE == "auto" else "")
     if out is None:
+        record_freshness(now, "-", [], 0, 0, 0, "fail", t0)
         send_plain(fail_message("모든 데이터 출처에서 수집에 실패했습니다."))
         return
 
     results, total, nodata = out["results"], out["total"], out["nodata"]
     base_dates = out["base_dates"]
     base_date = max(base_dates) if base_dates else "알 수 없음"
+    FRESH.clear()
+    FRESH.update(compute_fresh(now, base_date))
+    if FRESH.get("lag", 0) > 0:
+        print(f"⚠ 최신 수급 미반영: 예상 {FRESH['expected']} / 실제 {FRESH['base']} ({FRESH['lag']}거래일)")
 
     # 후보 종목에만 60일선 분석 (요청 수를 아끼기 위해)
     print(f"60일선 분석: {len(results)}종목")
@@ -1140,6 +1625,7 @@ def main():
     except Exception as e:
         print("성과 기록 처리 오류:", e)
 
+    record_freshness(now, label, base_dates, total, nodata, len(results), "ok", t0)
     wait_until_send_time()
     send_condition_messages(results, total, nodata, base_date, label)
     try:  # 별도 현황판: 실패해도 기존 알림에는 영향 없음
