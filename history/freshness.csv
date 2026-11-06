@@ -1,0 +1,2 @@
+﻿run_at,source,expected_base,actual_base,lag_days,stocks_at_base_pct,total,nodata,candidates,calc_min,status
+2026-11-06 19:20,네이버 증권,2026-11-06,2026-11-05,1,100.0,662,14,16,10.5,ok
